@@ -1,0 +1,39 @@
+{
+  "timestamp": "20251207_115308",
+  "feature_names": [
+    "average_corrosion_rate",
+    "thickness_mm",
+    "corrosion_thickness_ratio",
+    "days_since_inspection",
+    "risk_score",
+    "remaining_life_years",
+    "commodity",
+    "feature_type",
+    "cml_shape"
+  ],
+  "metrics": {
+    "test_accuracy": 0.95,
+    "roc_auc": 0.9930555555555556,
+    "f1_score": 0.75,
+    "cv_f1_mean": 0.8732323232323231,
+    "cv_f1_std": 0.11736747840541774,
+    "best_params": {
+      "classifier__class_weight": "balanced_subsample",
+      "classifier__max_depth": 10,
+      "classifier__min_samples_leaf": 2,
+      "classifier__min_samples_split": 2,
+      "classifier__n_estimators": 300
+    },
+    "confusion_matrix": [
+      [
+        35,
+        1
+      ],
+      [
+        1,
+        3
+      ]
+    ]
+  },
+  "model_path": "models\\cml_elimination_model_20251207_115308.joblib"
+}
