@@ -1,14 +1,14 @@
 import requests
 import json
 
-print("\n--- TEST 6: Verify Port 8002 ---")
+print("\n--- TEST 6: Verify Port 8000 ---")
 try:
     with open("data/sample_cml_data.csv", "rb") as f:
         file_content = f.read()
 
     files = {"file": ("sample_cml_data.csv", file_content, "text/csv")}
-    # Using 8002
-    response = requests.post("http://localhost:8002/upload-cml-data", files=files)
+    # Using 8000
+    response = requests.post("http://localhost:8000/upload-cml-data", files=files)
     print(f"Status Code: {response.status_code}")
 
     if response.status_code == 200:
