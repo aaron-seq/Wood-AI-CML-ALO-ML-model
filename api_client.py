@@ -2,7 +2,7 @@ import requests
 from typing import Optional, Dict, Any
 import streamlit as st
 
-API_BASE_URL = "http://localhost:8002"
+API_BASE_URL = "http://localhost:8000"
 
 
 def check_api_health() -> bool:
