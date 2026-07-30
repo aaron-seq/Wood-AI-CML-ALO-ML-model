@@ -10,13 +10,30 @@ condition monitoring, including:
 - Inspection scheduling optimization insights
 """
 
+from typing import Any
+
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+
+from app.features import MAX_REMAINING_LIFE_YEARS, remaining_life_years
+
+
+def _remaining_life(df: pd.DataFrame) -> pd.Series:
+    """Remaining life for each row, computed once and reused by every chart.
+
+    Uses the column already present on the frame when there is one,
+    otherwise derives it through the shared, divide-by-zero-safe helper in
+    app.features. The five call sites below previously each inlined their
+    own ``(thickness - 3.0) / rate.clip(lower=0.01)`` variant, so a change
+    to the formula reached some charts and not others.
+    """
+    if "remaining_life_years" in df.columns:
+        life = pd.to_numeric(df["remaining_life_years"], errors="coerce").fillna(0.0)
+    else:
+        life = remaining_life_years(df["thickness_mm"], df["average_corrosion_rate"])
+    return life.clip(0, MAX_REMAINING_LIFE_YEARS)
 
 
 def create_risk_matrix_heatmap(df: pd.DataFrame) -> go.Figure:
@@ -34,14 +51,6 @@ def create_risk_matrix_heatmap(df: pd.DataFrame) -> go.Figure:
     """
     # Create risk categories
     df = df.copy()
-    df["risk_category"] = pd.cut(
-        df["remaining_life_years"]
-        if "remaining_life_years" in df.columns
-        else (df["thickness_mm"] - 3.0) / df["average_corrosion_rate"].clip(lower=0.01),
-        bins=[0, 2, 5, 10, 20, float("inf")],
-        labels=["CRITICAL", "HIGH", "MEDIUM", "LOW", "MINIMAL"],
-    )
-
     # Create corrosion bins
     df["corrosion_bin"] = pd.cut(
         df["average_corrosion_rate"],
@@ -57,7 +66,13 @@ def create_risk_matrix_heatmap(df: pd.DataFrame) -> go.Figure:
     )
 
     # Create pivot table for heatmap
-    pivot = df.groupby(["thickness_bin", "corrosion_bin"]).size().unstack(fill_value=0)
+    # observed=False keeps every bin in the matrix even when no CML falls
+    # into it, so the heatmap always renders the full 5x5 grid. Stated
+    # explicitly because the pandas default for categorical groupers
+    # flipped to True in 3.0.
+    pivot = (
+        df.groupby(["thickness_bin", "corrosion_bin"], observed=False).size().unstack(fill_value=0)
+    )
 
     fig = go.Figure(
         data=go.Heatmap(
@@ -75,9 +90,7 @@ def create_risk_matrix_heatmap(df: pd.DataFrame) -> go.Figure:
             texttemplate="%{text}",
             textfont={"size": 14, "color": "white"},
             hoverongaps=False,
-            hovertemplate=(
-                "Thickness: %{y}<br>Corrosion Rate: %{x}<br>Count: %{z}<extra></extra>"
-            ),
+            hovertemplate=("Thickness: %{y}<br>Corrosion Rate: %{x}<br>Count: %{z}<extra></extra>"),
         )
     )
 
@@ -111,11 +124,7 @@ def create_remaining_life_distribution(df: pd.DataFrame) -> go.Figure:
     Returns:
         Plotly Figure with histogram and statistical markers
     """
-    remaining_life = (
-        df["remaining_life_years"]
-        if "remaining_life_years" in df.columns
-        else (df["thickness_mm"] - 3.0) / df["average_corrosion_rate"].clip(lower=0.01)
-    ).clip(upper=50)
+    remaining_life = _remaining_life(df)
 
     fig = go.Figure()
 
@@ -231,11 +240,7 @@ def create_inspection_priority_scatter(df: pd.DataFrame) -> go.Figure:
     """
     df = df.copy()
 
-    # Calculate remaining life if not present
-    if "remaining_life_years" not in df.columns:
-        df["remaining_life_years"] = (
-            (df["thickness_mm"] - 3.0) / df["average_corrosion_rate"].clip(lower=0.01)
-        ).clip(0, 50)
+    df["remaining_life_years"] = _remaining_life(df)
 
     # Create risk categories
     df["risk_category"] = pd.cut(
@@ -304,14 +309,8 @@ def create_feature_type_analysis(df: pd.DataFrame) -> go.Figure:
     # Create hierarchical data
     df = df.copy()
     if "risk_category" not in df.columns:
-        remaining_life = (
-            df["remaining_life_years"]
-            if "remaining_life_years" in df.columns
-            else (df["thickness_mm"] - 3.0)
-            / df["average_corrosion_rate"].clip(lower=0.01)
-        ).clip(0, 50)
         df["risk_category"] = pd.cut(
-            remaining_life,
+            _remaining_life(df),
             bins=[0, 2, 5, 10, float("inf")],
             labels=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
         )
@@ -350,11 +349,7 @@ def create_corrosion_trend_gauge(df: pd.DataFrame) -> go.Figure:
         Plotly Figure with gauge indicators
     """
     # Calculate metrics
-    remaining_life = (
-        df["remaining_life_years"]
-        if "remaining_life_years" in df.columns
-        else (df["thickness_mm"] - 3.0) / df["average_corrosion_rate"].clip(lower=0.01)
-    ).clip(0, 50)
+    remaining_life = _remaining_life(df)
 
     avg_remaining_life = remaining_life.mean()
     critical_pct = (remaining_life < 2).sum() / len(df) * 100
@@ -449,7 +444,7 @@ def create_corrosion_trend_gauge(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def calculate_advanced_statistics(df: pd.DataFrame) -> Dict[str, Any]:
+def calculate_advanced_statistics(df: pd.DataFrame) -> dict[str, Any]:
     """Calculate comprehensive statistics for the CML dataset.
 
     Computes API 570 compliant metrics including:
@@ -464,13 +459,7 @@ def calculate_advanced_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     Returns:
         Dictionary containing all computed statistics
     """
-    # Calculate remaining life if not present
-    if "remaining_life_years" not in df.columns:
-        remaining_life = (
-            (df["thickness_mm"] - 3.0) / df["average_corrosion_rate"].clip(lower=0.01)
-        ).clip(0, 50)
-    else:
-        remaining_life = df["remaining_life_years"].clip(0, 50)
+    remaining_life = _remaining_life(df)
 
     # Risk categorization
     risk_counts = pd.cut(
@@ -522,24 +511,37 @@ def calculate_advanced_statistics(df: pd.DataFrame) -> Dict[str, Any]:
             "next_12_months": int((remaining_life < 3).sum()),
             "avg_interval_months": float(inspection_intervals.mean()),
         },
-        "commodity_risk": df.groupby("commodity")
-        .apply(
-            lambda x: {
-                "count": len(x),
-                "avg_corrosion": float(x["average_corrosion_rate"].mean()),
-                "critical_count": int(
-                    (
-                        (x["thickness_mm"] - 3.0)
-                        / x["average_corrosion_rate"].clip(lower=0.01)
-                        < 2
-                    ).sum()
-                ),
-            }
-        )
-        .to_dict(),
+        "commodity_risk": _commodity_risk(df, remaining_life),
     }
 
     return stats
+
+
+def _commodity_risk(df: pd.DataFrame, remaining_life: pd.Series) -> dict[str, Any]:
+    """Per-commodity counts, mean corrosion rate and critical-CML tally.
+
+    Aggregates over the already-computed ``remaining_life`` rather than
+    recalculating it per group, so the critical threshold here agrees with
+    the ``risk_distribution`` totals above. Written as an explicit loop
+    because ``groupby(...).apply()`` returning dicts is deprecated in
+    pandas 2.2 and its replacement does not preserve this shape.
+    """
+    grouped = pd.DataFrame(
+        {
+            "commodity": df["commodity"],
+            "average_corrosion_rate": pd.to_numeric(df["average_corrosion_rate"], errors="coerce"),
+            "remaining_life": remaining_life,
+        }
+    ).groupby("commodity", observed=True)
+
+    return {
+        str(commodity): {
+            "count": int(len(group)),
+            "avg_corrosion": float(group["average_corrosion_rate"].mean()),
+            "critical_count": int((group["remaining_life"] < 2).sum()),
+        }
+        for commodity, group in grouped
+    }
 
 
 def create_timeline_forecast_chart(df: pd.DataFrame) -> go.Figure:
@@ -556,16 +558,11 @@ def create_timeline_forecast_chart(df: pd.DataFrame) -> go.Figure:
     """
     df = df.copy()
 
-    # Calculate remaining life and next inspection
-    if "remaining_life_years" not in df.columns:
-        df["remaining_life_years"] = (
-            (df["thickness_mm"] - 3.0) / df["average_corrosion_rate"].clip(lower=0.01)
-        ).clip(0, 50)
+    df["remaining_life_years"] = _remaining_life(df)
 
     # Calculate inspection months
     df["inspection_months"] = (
-        df["remaining_life_years"].apply(lambda x: min(x / 1.5, 6) if x > 0 else 0.5)
-        * 12
+        df["remaining_life_years"].apply(lambda x: min(x / 1.5, 6) if x > 0 else 0.5) * 12
     )
 
     # Create time buckets

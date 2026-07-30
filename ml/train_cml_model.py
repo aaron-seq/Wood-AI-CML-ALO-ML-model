@@ -1,12 +1,13 @@
-import pandas as pd
 from pathlib import Path
-from sklearn.model_selection import train_test_split
+
+import joblib
+import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report
-import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_PATH = BASE_DIR / "data" / "sample_cml_data.csv"
@@ -37,9 +38,7 @@ def build_pipeline(df: pd.DataFrame):
     categorical_features = ["commodity", "feature_type", "cml_shape"]
 
     numeric_transformer = Pipeline(steps=[("scaler", StandardScaler())])
-    categorical_transformer = Pipeline(
-        steps=[("onehot", OneHotEncoder(handle_unknown="ignore"))]
-    )
+    categorical_transformer = Pipeline(steps=[("onehot", OneHotEncoder(handle_unknown="ignore"))])
 
     preprocessor = ColumnTransformer(
         transformers=[

@@ -1,227 +1,421 @@
-﻿from pathlib import Path
-from typing import Any, Dict, List, Optional
+"""FastAPI application for CML elimination scoring and inspection planning.
+
+This is the single canonical API entry point. Start it with:
+
+    uvicorn app.main:app --host 0.0.0.0 --port 8000
+"""
+
+from __future__ import annotations
+
 import logging
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any
+
 import joblib
 import pandas as pd
-import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from datetime import datetime
-from app.schemas import HealthResponse, UploadResponse, ScoreResponse, ForecastOutput
-from app.utils import validate_cml_dataframe, calculate_inspection_schedule
+
+from app.config import settings
+from app.features import engineer_features
+from app.forecasting import CMLForecaster
+from app.ingestion import UploadError, read_upload
+from app.schemas import (
+    ForecastOutput,
+    HealthResponse,
+    ModelInfoResponse,
+    ReportResponse,
+    ScoreResponse,
+    SMEOverride,
+    SMEOverrideListResponse,
+    SMEOverrideResponse,
+    UploadResponse,
+)
+from app.sme_override import SMEOverrideManager
+from app.utils import (
+    calculate_inspection_schedule,
+    generate_elimination_report,
+    validate_cml_dataframe,
+)
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=settings.LOG_LEVEL,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Wood AI CML ALO API",
-    version="0.3.0",
-    description="ML API for CML optimization",
+# Fallback for a model whose pickle predates ``feature_names_in_``. The
+# live column list is read off the fitted estimator so it cannot drift.
+_FALLBACK_FEATURE_COLUMNS = [
+    "average_corrosion_rate",
+    "thickness_mm",
+    "corrosion_thickness_ratio",
+    "days_since_inspection",
+    "risk_score",
+    "remaining_life_years",
+    "commodity",
+    "feature_type",
+    "cml_shape",
+]
+
+HIGH_CONFIDENCE_MARGIN = 0.3
+
+#: Populated during startup; ``None`` means the API runs in degraded mode
+#: where non-ML endpoints still work but scoring returns 503.
+model: Any | None = None
+
+sme_manager = SMEOverrideManager(settings.SME_OVERRIDE_FILE)
+forecaster = CMLForecaster(
+    minimum_thickness=settings.DEFAULT_MINIMUM_THICKNESS,
+    safety_factor=settings.SAFETY_FACTOR,
 )
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-MODEL_PATH = BASE_DIR / "models" / "cml_elimination_model.joblib"
 
-model = None
-try:
-    if MODEL_PATH.exists():
-        model = joblib.load(MODEL_PATH)
-        logger.info(f"Model loaded successfully from {MODEL_PATH}")
-    else:
-        logger.warning(f"Model file not found at {MODEL_PATH}")
-except Exception as e:
-    logger.error(f"Failed to load model: {e}")
+def _load_model() -> Any | None:
+    """Load the model artifact, returning ``None`` if it is unusable.
 
-
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    df["corrosion_thickness_ratio"] = df["average_corrosion_rate"] / df["thickness_mm"]
-    min_thickness = 3.0
-    df["remaining_life_years"] = (df["thickness_mm"] - min_thickness) / df[
-        "average_corrosion_rate"
-    ]
-    df["remaining_life_years"] = df["remaining_life_years"].clip(lower=0)
-    if "last_inspection_date" in df.columns:
-        df["last_inspection_date"] = pd.to_datetime(
-            df["last_inspection_date"], errors="coerce"
+    A missing or corrupt artifact must not stop the process: the health
+    endpoint has to stay reachable so an orchestrator can report *why* the
+    container is unhealthy instead of crash-looping with no diagnostics.
+    """
+    path = settings.MODEL_PATH
+    if not path.exists():
+        logger.warning(
+            "Model artifact not found at %s. Scoring endpoints will return 503. "
+            "Train one with: python ml/train_enhanced.py data/cml_sample_500.csv",
+            path,
         )
-        df["days_since_inspection"] = (
-            pd.Timestamp.now() - df["last_inspection_date"]
-        ).dt.days
-        df["days_since_inspection"] = df["days_since_inspection"].fillna(365)
-    else:
-        df["days_since_inspection"] = 365
-    if "risk_score" not in df.columns:
-        df["risk_score"] = (
-            df["average_corrosion_rate"] * 20 + (10 - df["thickness_mm"]) * 5
-        ).clip(0, 100)
-    return df
+        return None
+    try:
+        loaded = joblib.load(path)
+    except Exception:
+        logger.exception("Failed to load model from %s", path)
+        return None
+    logger.info("Model loaded from %s (%s)", path, type(loaded).__name__)
+    return loaded
 
 
-@app.get("/")
-async def root():
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Load the model once per process, at startup rather than at import."""
+    global model
+    model = _load_model()
+    yield
+    model = None
+
+
+app = FastAPI(
+    title=settings.API_TITLE,
+    version=settings.API_VERSION,
+    description=settings.API_DESCRIPTION,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Tag each request so a log line can be traced back to a client report."""
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["x-request-id"] = request_id
+    return response
+
+
+@app.exception_handler(UploadError)
+async def upload_error_handler(request: Request, exc: UploadError) -> JSONResponse:
+    """Report upload problems as 400s, with the request id for correlation."""
+    request_id = getattr(request.state, "request_id", None)
+    logger.warning("Rejected upload (request_id=%s): %s", request_id, exc)
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": str(exc), "request_id": request_id},
+    )
+
+
+def _require_model() -> Any:
+    if model is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "ML model is not loaded. Train or mount a model artifact and restart.",
+        )
+    return model
+
+
+def _feature_columns(loaded_model: Any) -> list[str]:
+    names = getattr(loaded_model, "feature_names_in_", None)
+    return list(names) if names is not None else list(_FALLBACK_FEATURE_COLUMNS)
+
+
+@app.get("/", tags=["meta"])
+async def root() -> dict[str, str]:
+    """Service banner with a pointer to the interactive documentation."""
     return {
-        "message": "Wood AI CML Optimization API",
-        "version": "0.3.0",
+        "message": settings.API_TITLE,
+        "version": settings.API_VERSION,
         "documentation": "/docs",
     }
 
 
-@app.get("/health", response_model=HealthResponse)
-async def health():
+@app.get("/health", response_model=HealthResponse, tags=["meta"])
+async def health() -> dict[str, Any]:
+    """Liveness and readiness probe used by Docker, Compose and the dashboard."""
     return {
-        "status": "ok",
+        "status": "ok" if model is not None else "degraded",
         "model_loaded": model is not None,
-        "model_path": str(MODEL_PATH) if MODEL_PATH.exists() else None,
-        "version": "0.3.0",
+        "model_path": str(settings.MODEL_PATH) if settings.MODEL_PATH.exists() else None,
+        "version": settings.API_VERSION,
     }
 
 
-@app.post("/upload-cml-data", response_model=UploadResponse)
-async def upload_cml_data(file: UploadFile = File(...)):
+@app.get("/model/info", response_model=ModelInfoResponse, tags=["meta"])
+async def model_info() -> dict[str, Any]:
+    """Describe the loaded estimator and the features it consumes."""
+    loaded = _require_model()
+    return {
+        "model_type": type(loaded).__name__,
+        "features_used": _feature_columns(loaded),
+        "model_path": str(settings.MODEL_PATH),
+    }
+
+
+@app.post("/upload-cml-data", response_model=UploadResponse, tags=["data"])
+async def upload_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Parse and validate a CML file without scoring it.
+
+    Returns the detected schema, a short preview and a validation report so
+    a user can correct their data before spending time on a scoring run.
+    """
+    df = await read_upload(file, settings.MAX_UPLOAD_BYTES, settings.MAX_UPLOAD_ROWS)
+    validation = validate_cml_dataframe(df)
+
+    return {
+        "filename": file.filename,
+        "rows": len(df),
+        "columns": list(df.columns),
+        # NaN is not valid JSON; converting to None keeps the preview
+        # serialisable for frames with missing cells.
+        "preview": df.head(5).astype(object).where(pd.notna(df.head(5)), None).to_dict("records"),
+        "message": f"Successfully parsed {len(df)} records",
+        "validation": validation,
+    }
+
+
+@app.post("/score-cml-data", response_model=ScoreResponse, tags=["scoring"])
+async def score_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Score every CML in the uploaded file for elimination.
+
+    Rows are scored as one batch. The response echoes at most
+    ``MAX_RESULTS_IN_RESPONSE`` results; ``total_results`` always reports
+    the true count.
+    """
+    loaded = _require_model()
+    df = await read_upload(file, settings.MAX_UPLOAD_BYTES, settings.MAX_UPLOAD_ROWS)
+
+    validation = validate_cml_dataframe(df)
+    if not validation["valid"]:
+        raise UploadError("; ".join(validation["errors"]))
+
+    features = engineer_features(df, minimum_thickness_mm=settings.DEFAULT_MINIMUM_THICKNESS)
+
+    columns = _feature_columns(loaded)
+    missing = [column for column in columns if column not in features.columns]
+    if missing:
+        raise UploadError(f"Missing columns required by the model: {', '.join(missing)}")
+
+    logger.info("Scoring %d CMLs from %s", len(features), file.filename)
     try:
-        if file.filename.endswith(".csv"):
-            df = pd.read_csv(file.file)
-        elif file.filename.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(file.file)
-        else:
-            raise HTTPException(400, "Unsupported file format")
-        result = validate_cml_dataframe(df)
-        logger.info(
-            f"Successfully parsed {file.filename}: {len(df)} rows, {len(df.columns)} columns"
+        X = features[columns]
+        predictions = loaded.predict(X)
+        probabilities = loaded.predict_proba(X)[:, 1]
+    except Exception as exc:
+        logger.exception("Model inference failed for %s", file.filename)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Model inference failed: {exc}"
+        ) from exc
+
+    # Positional access throughout: ``iterrows`` yields index *labels*,
+    # which are only interchangeable with positions for a default
+    # RangeIndex, and predictions are positional numpy arrays.
+    ids = features["id_number"].astype(str).tolist()
+    results = [
+        {
+            "id_number": ids[position],
+            "predicted_elimination_flag": int(predictions[position]),
+            "elimination_probability": float(probabilities[position]),
+            "recommendation": "ELIMINATE" if predictions[position] == 1 else "KEEP",
+            "confidence": "HIGH"
+            if abs(probabilities[position] - 0.5) > HIGH_CONFIDENCE_MARGIN
+            else "MODERATE",
+        }
+        for position in range(len(features))
+    ]
+
+    logger.info("Scored %d CMLs from %s", len(results), file.filename)
+    return {
+        "rows_scored": len(results),
+        "results": results[: settings.MAX_RESULTS_IN_RESPONSE],
+        "total_results": len(results),
+        "results_truncated": len(results) > settings.MAX_RESULTS_IN_RESPONSE,
+        "model_info": {
+            "model_type": type(loaded).__name__,
+            "features_used": columns,
+        },
+        "message": f"Successfully scored {len(results)} CML records",
+    }
+
+
+@app.post(
+    "/forecast-remaining-life",
+    response_model=list[ForecastOutput],
+    tags=["forecasting"],
+)
+async def forecast_remaining_life(file: UploadFile = File(...)) -> list[ForecastOutput]:
+    """Project remaining life and a next-inspection date for each CML."""
+    df = await read_upload(file, settings.MAX_UPLOAD_BYTES, settings.MAX_UPLOAD_ROWS)
+
+    validation = validate_cml_dataframe(df)
+    if not validation["valid"]:
+        raise UploadError("; ".join(validation["errors"]))
+
+    logger.info("Forecasting %d CMLs from %s", len(df), file.filename)
+
+    results: list[ForecastOutput] = []
+    skipped = 0
+    for _, row in df.iterrows():
+        try:
+            schedule = calculate_inspection_schedule(
+                corrosion_rate=float(row["average_corrosion_rate"]),
+                thickness=float(row["thickness_mm"]),
+                min_thickness=settings.DEFAULT_MINIMUM_THICKNESS,
+                safety_factor=settings.SAFETY_FACTOR,
+            )
+        except (ValueError, TypeError) as exc:
+            # One unusable row must not fail the batch, but silently
+            # dropping rows would misreport coverage -- count them.
+            skipped += 1
+            logger.warning("Skipping CML %s: %s", row.get("id_number", "<unknown>"), exc)
+            continue
+
+        results.append(
+            ForecastOutput(
+                id_number=str(row["id_number"]),
+                remaining_life_years=schedule["remaining_life_years"],
+                next_inspection_date=schedule["next_inspection_date"],
+                estimated_thickness_at_next_inspection=schedule[
+                    "estimated_thickness_at_next_inspection"
+                ],
+                recommended_inspection_frequency_months=schedule["inspection_interval_months"],
+                risk_level=schedule["risk_level"],
+            )
         )
-        return {
-            "filename": file.filename,
-            "rows": len(df),
-            "columns": list(df.columns),
-            "preview": df.head(5).to_dict("records"),
-            "message": f"Successfully uploaded {len(df)} records",
-            "validation": result,
-        }
-    except Exception as e:
-        logger.error(f"Error reading file: {e}")
-        raise HTTPException(500, f"Error processing file: {str(e)}")
+
+    if skipped:
+        logger.warning("Forecast for %s skipped %d unusable row(s)", file.filename, skipped)
+    logger.info("Generated %d forecasts from %s", len(results), file.filename)
+    return results
 
 
-@app.post("/score-cml-data", response_model=ScoreResponse)
-async def score_cml_data(file: UploadFile = File(...)):
-    if model is None:
-        raise HTTPException(503, "ML model not loaded")
+@app.post("/generate-report", response_model=ReportResponse, tags=["reporting"])
+async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Score a file and summarise the results as an elimination report.
+
+    Aggregates predictions by commodity and feature type and surfaces the
+    strongest elimination candidates alongside the marginal cases that
+    warrant an engineer's review.
+    """
+    loaded = _require_model()
+    df = await read_upload(file, settings.MAX_UPLOAD_BYTES, settings.MAX_UPLOAD_ROWS)
+
+    validation = validate_cml_dataframe(df)
+    if not validation["valid"]:
+        raise UploadError("; ".join(validation["errors"]))
+
+    features = engineer_features(df, minimum_thickness_mm=settings.DEFAULT_MINIMUM_THICKNESS)
+    columns = _feature_columns(loaded)
+    missing = [column for column in columns if column not in features.columns]
+    if missing:
+        raise UploadError(f"Missing columns required by the model: {', '.join(missing)}")
+
     try:
-        if file.filename.endswith(".csv"):
-            df = pd.read_csv(file.file)
-        elif file.filename.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(file.file)
-        else:
-            raise HTTPException(400, "Unsupported file format")
-        logger.info(f"Scoring {len(df)} CMLs from {file.filename}")
-        df = engineer_features(df)
-        feature_cols = [
-            "average_corrosion_rate",
-            "thickness_mm",
-            "commodity",
-            "feature_type",
-            "cml_shape",
-            "remaining_life_years",
-            "corrosion_thickness_ratio",
-            "risk_score",
-            "days_since_inspection",
-        ]
-        missing = [col for col in feature_cols if col not in df.columns]
-        if missing:
-            raise ValueError(f"Missing columns: {missing}")
-        X = df[feature_cols]
-        predictions = model.predict(X)
-        probabilities = model.predict_proba(X)[:, 1]
-        results = []
-        for idx, row in df.iterrows():
-            results.append(
-                {
-                    "id_number": str(row["id_number"]),
-                    "predicted_elimination_flag": int(predictions[idx]),
-                    "elimination_probability": float(probabilities[idx]),
-                    "recommendation": "ELIMINATE" if predictions[idx] == 1 else "KEEP",
-                    "confidence": "HIGH"
-                    if abs(probabilities[idx] - 0.5) > 0.3
-                    else "MODERATE",
-                }
-            )
-        logger.info(f"Successfully scored {len(df)} CMLs")
-        return {
-            "rows_scored": len(df),
-            "results": results[:100],
-            "total_results": len(results),
-            "model_info": {
-                "model_type": type(model).__name__,
-                "features_used": feature_cols,
-            },
-            "message": f"Successfully scored {len(df)} CML records",
-        }
-    except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        raise HTTPException(500, f"Error during prediction: {str(e)}")
+        X = features[columns]
+        features["predicted_elimination"] = loaded.predict(X)
+        features["elimination_probability"] = loaded.predict_proba(X)[:, 1]
+    except Exception as exc:
+        logger.exception("Model inference failed while generating a report")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Model inference failed: {exc}"
+        ) from exc
+
+    features["recommendation"] = features["predicted_elimination"].map({1: "ELIMINATE", 0: "KEEP"})
+    features["confidence_level"] = (
+        (features["elimination_probability"] - 0.5).abs() > HIGH_CONFIDENCE_MARGIN
+    ).map({True: "HIGH", False: "MODERATE"})
+
+    report = generate_elimination_report(features)
+    report["generated_from"] = file.filename
+    return report
 
 
-@app.post("/forecast-remaining-life", response_model=List[ForecastOutput])
-async def forecast_remaining_life(file: UploadFile = File(...)):
+@app.get("/sme-override", response_model=SMEOverrideListResponse, tags=["sme"])
+async def list_sme_overrides() -> dict[str, Any]:
+    """List every recorded expert override plus agreement statistics."""
+    return {
+        "overrides": sme_manager.get_all_overrides(),
+        "statistics": sme_manager.get_override_statistics(),
+    }
+
+
+@app.post(
+    "/sme-override",
+    response_model=SMEOverrideResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["sme"],
+)
+async def create_sme_override(override: SMEOverride) -> dict[str, Any]:
+    """Record an expert decision that supersedes the model's recommendation.
+
+    Overrides are keyed by CML id: posting the same id again replaces the
+    previous decision rather than accumulating duplicates.
+    """
     try:
-        if file.filename.endswith(".csv"):
-            df = pd.read_csv(file.file)
-        elif file.filename.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(file.file)
-        else:
-            raise HTTPException(400, "Unsupported file format")
+        stored = sme_manager.add_override(
+            id_number=override.id_number,
+            sme_decision=override.sme_decision,
+            reason=override.reason,
+            sme_name=override.sme_name,
+            original_prediction=override.original_prediction,
+            original_probability=override.original_probability,
+        )
+    except OSError as exc:
+        logger.exception("Failed to persist SME override for %s", override.id_number)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Could not persist the override: {exc}"
+        ) from exc
 
-        logger.info(f"Forecasting for {len(df)} CMLs from {file.filename}")
+    logger.info("Recorded SME override for %s by %s", override.id_number, override.sme_name)
+    return {"override": stored, "message": f"Override recorded for {override.id_number}"}
 
-        # Validate data first
-        validation = validate_cml_dataframe(df)
-        if not validation["valid"]:
-            logger.warning(
-                f"Validation failed for {file.filename}: {validation['errors']}"
-            )
-            # We might want to still proceed or raise error. For now, let's proceed but log.
 
-        results = []
-        for _, row in df.iterrows():
-            try:
-                # Map CSV columns to function arguments
-                # Assuming CSV has 'average_corrosion_rate' and 'thickness_mm'
-                schedule = calculate_inspection_schedule(
-                    corrosion_rate=float(row["average_corrosion_rate"]),
-                    thickness=float(row["thickness_mm"]),
-                    min_thickness=3.0,  # Default or could be from request
-                    safety_factor=1.5,
-                )
-
-                results.append(
-                    ForecastOutput(
-                        id_number=str(row["id_number"]),
-                        remaining_life_years=schedule["remaining_life_years"],
-                        next_inspection_date=schedule["next_inspection_date"],
-                        estimated_thickness_at_next_inspection=schedule[
-                            "estimated_thickness_at_next_inspection"
-                        ],
-                        recommended_inspection_frequency_months=schedule[
-                            "inspection_interval_months"
-                        ],
-                        risk_level=schedule["risk_level"],
-                    )
-                )
-            except Exception as row_e:
-                logger.warning(f"Skipping row due to error: {row_e}")
-                continue
-
-        logger.info(f"Successfully generated forecasts for {len(results)} CMLs")
-        return results
-
-    except Exception as e:
-        logger.error(f"Forecast error: {e}")
-        raise HTTPException(500, f"Error during forecasting: {str(e)}")
+@app.delete("/sme-override/{id_number}", tags=["sme"])
+async def delete_sme_override(id_number: str) -> dict[str, str]:
+    """Withdraw a previously recorded override."""
+    if not sme_manager.remove_override(id_number):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No override recorded for CML {id_number}")
+    return {"message": f"Override removed for {id_number}"}
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=settings.HOST, port=settings.PORT)

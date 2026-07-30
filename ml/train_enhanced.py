@@ -1,22 +1,23 @@
 """Enhanced CML Elimination Model Training Pipeline."""
 
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, f1_score
-import joblib
-from pathlib import Path
-from datetime import datetime
 import json
 import sys
+from datetime import datetime
+from pathlib import Path
 
-# Add parent directory to path for imports
+import joblib
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, roc_auc_score
+from sklearn.model_selection import GridSearchCV, cross_val_score, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+# Allow running this file directly as `python ml/train_enhanced.py`.
 sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from app.features import engineer_features  # noqa: E402
 
 
 class EnhancedCMLModelTrainer:
@@ -33,152 +34,159 @@ class EnhancedCMLModelTrainer:
         """Load and validate CML data."""
         print(f"Loading data from {self.data_path}")
         df = pd.read_csv(self.data_path)
-        
+
         required_cols = [
-            'average_corrosion_rate', 'thickness_mm', 'commodity',
-            'feature_type', 'cml_shape', 'elimination_flag'
+            "average_corrosion_rate",
+            "thickness_mm",
+            "commodity",
+            "feature_type",
+            "cml_shape",
+            "elimination_flag",
         ]
         missing = set(required_cols) - set(df.columns)
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
-        
+
         print(f"Loaded {len(df)} records")
         return df
 
     def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create additional features for the model."""
+        """Create the derived features the model consumes.
+
+        Delegates to app.features so training and serving compute these
+        columns with exactly the same code. Previously each side had its
+        own copy of the formulas, and only the serving copy guarded
+        against division by zero.
+
+        The earlier version also derived high_corrosion, thin_wall,
+        risk_interaction and low_remaining_life. None of them were listed
+        in prepare_features, so they were computed and discarded on every
+        run; they have been removed rather than wired in, because adding
+        them would change the model's inputs.
+        """
         print("Engineering features...")
-        
-        # Corrosion-thickness ratio
-        df['corrosion_thickness_ratio'] = df['average_corrosion_rate'] / df['thickness_mm']
-        
-        # Risk categorization
-        df['high_corrosion'] = (df['average_corrosion_rate'] > 0.15).astype(int)
-        df['thin_wall'] = (df['thickness_mm'] < 8.0).astype(int)
-        
-        # Interaction features
-        df['risk_interaction'] = df['high_corrosion'] * df['thin_wall']
-        
-        # Time-based features if available
-        if 'last_inspection_date' in df.columns:
-            df['last_inspection_date'] = pd.to_datetime(df['last_inspection_date'])
-            df['days_since_inspection'] = (datetime.now() - df['last_inspection_date']).dt.days
-        
-        # Remaining life features if available
-        if 'remaining_life_years' in df.columns:
-            df['low_remaining_life'] = (df['remaining_life_years'] < 10).astype(int)
-        
-        return df
+        return engineer_features(df)
 
     def prepare_features(self, df: pd.DataFrame):
         """Prepare feature matrix and target variable."""
-        numerical_features = [
-            'average_corrosion_rate',
-            'thickness_mm',
-            'corrosion_thickness_ratio'
-        ]
-        
-        categorical_features = ['commodity', 'feature_type', 'cml_shape']
-        
+        numerical_features = ["average_corrosion_rate", "thickness_mm", "corrosion_thickness_ratio"]
+
+        categorical_features = ["commodity", "feature_type", "cml_shape"]
+
         # Add optional features if they exist
-        if 'days_since_inspection' in df.columns:
-            numerical_features.append('days_since_inspection')
-        if 'risk_score' in df.columns:
-            numerical_features.append('risk_score')
-        if 'remaining_life_years' in df.columns:
-            numerical_features.append('remaining_life_years')
-        
+        if "days_since_inspection" in df.columns:
+            numerical_features.append("days_since_inspection")
+        if "risk_score" in df.columns:
+            numerical_features.append("risk_score")
+        if "remaining_life_years" in df.columns:
+            numerical_features.append("remaining_life_years")
+
         # Create preprocessing pipelines
         numerical_transformer = StandardScaler()
-        categorical_transformer = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
-        
+        categorical_transformer = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+
         preprocessor = ColumnTransformer(
             transformers=[
-                ('num', numerical_transformer, numerical_features),
-                ('cat', categorical_transformer, categorical_features)
+                ("num", numerical_transformer, numerical_features),
+                ("cat", categorical_transformer, categorical_features),
             ]
         )
-        
+
         X = df[numerical_features + categorical_features]
-        y = df['elimination_flag']
-        
+        y = df["elimination_flag"]
+
         self.feature_names = numerical_features + categorical_features
-        
+
         return X, y, preprocessor
 
-    def train_model(self, X, y, preprocessor):
-        """Train Random Forest classifier with hyperparameter tuning."""
+    #: Searched when no explicit grid is supplied. Kept as a class
+    #: attribute so callers (and tests) can narrow it without editing code.
+    DEFAULT_PARAM_GRID = {
+        "classifier__n_estimators": [100, 200, 300],
+        "classifier__max_depth": [10, 20, None],
+        "classifier__min_samples_split": [2, 5],
+        "classifier__min_samples_leaf": [1, 2],
+        "classifier__class_weight": ["balanced", "balanced_subsample"],
+    }
+
+    def train_model(self, X, y, preprocessor, param_grid: dict | None = None):
+        """Train a Random Forest classifier with hyperparameter tuning.
+
+        Args:
+            X: Feature matrix.
+            y: Binary elimination target.
+            preprocessor: Fitted-on-train ColumnTransformer.
+            param_grid: Grid to search. Defaults to DEFAULT_PARAM_GRID;
+                pass ``{}`` to fit a single estimator without a search.
+
+        Returns:
+            A dictionary of evaluation metrics.
+        """
         print("Training model...")
-        
+
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
-        
+
         # Create pipeline
-        pipeline = Pipeline([
-            ('preprocessor', preprocessor),
-            ('classifier', RandomForestClassifier(random_state=42))
-        ])
-        
-        # Hyperparameter grid
-        param_grid = {
-            'classifier__n_estimators': [100, 200, 300],
-            'classifier__max_depth': [10, 20, None],
-            'classifier__min_samples_split': [2, 5],
-            'classifier__min_samples_leaf': [1, 2],
-            'classifier__class_weight': ['balanced', 'balanced_subsample']
-        }
-        
-        # Grid search with cross-validation
-        grid_search = GridSearchCV(
-            pipeline,
-            param_grid,
-            cv=5,
-            scoring='f1',
-            n_jobs=-1,
-            verbose=1
+        pipeline = Pipeline(
+            [
+                ("preprocessor", preprocessor),
+                ("classifier", RandomForestClassifier(random_state=42)),
+            ]
         )
-        
+
+        if param_grid is None:
+            param_grid = self.DEFAULT_PARAM_GRID
+
+        # Grid search with cross-validation. Folds are capped by the size
+        # of the smaller class so a small dataset cannot make CV fail.
+        n_splits = max(2, min(5, int(y.value_counts().min())))
+        grid_search = GridSearchCV(
+            pipeline, param_grid, cv=n_splits, scoring="f1", n_jobs=-1, verbose=1
+        )
+
         grid_search.fit(X_train, y_train)
-        
+
         self.model = grid_search.best_estimator_
-        
+
         # Evaluate
         y_pred = self.model.predict(X_test)
         y_proba = self.model.predict_proba(X_test)[:, 1]
-        
+
         print("\nClassification Report:")
-        print(classification_report(y_test, y_pred, target_names=['Keep', 'Eliminate']))
+        print(classification_report(y_test, y_pred, target_names=["Keep", "Eliminate"]))
         print(f"\nROC-AUC Score: {roc_auc_score(y_test, y_proba):.4f}")
         print(f"F1 Score: {f1_score(y_test, y_pred):.4f}")
         print(f"\nBest Parameters: {grid_search.best_params_}")
-        
+
         # Cross-validation scores
-        cv_scores = cross_val_score(self.model, X, y, cv=5, scoring='f1')
+        cv_scores = cross_val_score(self.model, X, y, cv=n_splits, scoring="f1")
         print(f"\nCross-validation F1 scores: {cv_scores}")
         print(f"Mean CV F1: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
-        
+
         # Feature importance
-        if hasattr(self.model.named_steps['classifier'], 'feature_importances_'):
-            importances = self.model.named_steps['classifier'].feature_importances_
-            feature_names_transformed = self.model.named_steps['preprocessor'].get_feature_names_out()
-            feature_importance_df = pd.DataFrame({
-                'feature': feature_names_transformed,
-                'importance': importances
-            }).sort_values('importance', ascending=False)
-            
+        if hasattr(self.model.named_steps["classifier"], "feature_importances_"):
+            importances = self.model.named_steps["classifier"].feature_importances_
+            feature_names_transformed = self.model.named_steps[
+                "preprocessor"
+            ].get_feature_names_out()
+            feature_importance_df = pd.DataFrame(
+                {"feature": feature_names_transformed, "importance": importances}
+            ).sort_values("importance", ascending=False)
+
             print("\nTop 10 Feature Importances:")
             print(feature_importance_df.head(10).to_string(index=False))
-        
+
         return {
-            'test_accuracy': float(self.model.score(X_test, y_test)),
-            'roc_auc': float(roc_auc_score(y_test, y_proba)),
-            'f1_score': float(f1_score(y_test, y_pred)),
-            'cv_f1_mean': float(cv_scores.mean()),
-            'cv_f1_std': float(cv_scores.std()),
-            'best_params': grid_search.best_params_,
-            'confusion_matrix': confusion_matrix(y_test, y_pred).tolist()
+            "test_accuracy": float(self.model.score(X_test, y_test)),
+            "roc_auc": float(roc_auc_score(y_test, y_proba)),
+            "f1_score": float(f1_score(y_test, y_pred)),
+            "cv_f1_mean": float(cv_scores.mean()),
+            "cv_f1_std": float(cv_scores.std()),
+            "best_params": grid_search.best_params_,
+            "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
         }
 
     def save_model(self, metrics: dict):
@@ -186,48 +194,49 @@ class EnhancedCMLModelTrainer:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_path = self.model_output_dir / f"cml_elimination_model_{timestamp}.joblib"
         latest_path = self.model_output_dir / "cml_elimination_model.joblib"
-        
+
         # Save model
         joblib.dump(self.model, model_path)
         joblib.dump(self.model, latest_path)
-        
+
         # Save metadata
         metadata = {
-            'timestamp': timestamp,
-            'feature_names': self.feature_names,
-            'metrics': metrics,
-            'model_path': str(model_path)
+            "timestamp": timestamp,
+            "feature_names": self.feature_names,
+            "metrics": metrics,
+            "model_path": str(model_path),
         }
-        
+
         metadata_path = self.model_output_dir / f"model_metadata_{timestamp}.json"
-        with open(metadata_path, 'w') as f:
+        with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
-        
+
         print(f"\nModel saved to {model_path}")
         print(f"Latest model: {latest_path}")
-        
+
         return model_path
 
 
 def train_enhanced_cml_model(data_path: str = "data/sample_cml_data.csv") -> Path:
     """Main training function."""
     trainer = EnhancedCMLModelTrainer(data_path)
-    
+
     # Load and prepare data
     df = trainer.load_data()
     df = trainer.engineer_features(df)
     X, y, preprocessor = trainer.prepare_features(df)
-    
+
     # Train model
     metrics = trainer.train_model(X, y, preprocessor)
-    
+
     # Save model
     model_path = trainer.save_model(metrics)
-    
+
     return model_path
 
 
 if __name__ == "__main__":
     import sys
+
     data_path = sys.argv[1] if len(sys.argv) > 1 else "data/sample_cml_data.csv"
     train_enhanced_cml_model(data_path)

@@ -5,13 +5,12 @@ customized for Wood Engineering with specific branding, educational resources,
 and strict data handling policies.
 """
 
-from typing import Optional
-import streamlit as st
+import logging
+from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-from pathlib import Path
-import logging
+import streamlit as st
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Use proper imports
 try:
+    from api_client import APIError, check_api_health, get_api_base_url, score_cml_data
     from app.forecasting import CMLForecaster
     from app.sme_override import SMEOverrideManager
     from app.utils import validate_cml_dataframe
@@ -112,7 +112,7 @@ def get_sme_manager() -> SMEOverrideManager:
     return SMEOverrideManager()
 
 
-def read_uploaded_file(uploaded_file) -> Optional[pd.DataFrame]:
+def read_uploaded_file(uploaded_file) -> pd.DataFrame | None:
     try:
         if uploaded_file.name.endswith(".csv"):
             return pd.read_csv(uploaded_file)
@@ -137,7 +137,11 @@ if page == "Overview":
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("System Status", "Operational")
+        # Probe the API rather than asserting health unconditionally.
+        api_up = check_api_health()
+        st.metric("Scoring API", "Online" if api_up else "Offline")
+        if not api_up:
+            st.caption(f"No response from {get_api_base_url()}")
     with col2:
         st.metric("Model Version", "RF-Ensemble v2.1")
     with col3:
@@ -150,9 +154,7 @@ if page == "Overview":
 
     if st.session_state["data"] is None:
         st.info("Welcome to the Wood Engineering CML Analysis Tool.")
-        st.warning(
-            "No data loaded. Please go to the **Upload & Analyze** page to begin."
-        )
+        st.warning("No data loaded. Please go to the **Upload & Analyze** page to begin.")
     else:
         df = st.session_state["data"]
         st.subheader("Current Dataset Analytics")
@@ -202,24 +204,16 @@ elif page == "Upload & Analyze":
                 if st.button("Run ML Analysis", type="primary"):
                     with st.spinner("Analyzing CML patterns..."):
                         try:
-                            from api_client import score_cml_data, check_api_health
-
-                            if not check_api_health():
-                                st.error("API server is not responding.")
-                            else:
-                                # Reset file pointer
-                                uploaded_file.seek(0)
-                                result = score_cml_data(uploaded_file)
-
-                                if result:
-                                    st.session_state["analysis_results"] = result
-                                    st.success("Analysis complete.")
-                        except ImportError:
-                            st.warning(
-                                "API Client not found. Ensure backend is running."
+                            uploaded_file.seek(0)
+                            result = score_cml_data(uploaded_file)
+                            st.session_state["analysis_results"] = result
+                            st.success(f"Analysis complete: {result['total_results']} CMLs scored.")
+                        except APIError as e:
+                            st.error(str(e))
+                            st.caption(
+                                f"The dashboard is configured to call {get_api_base_url()}. "
+                                "Start the API with `make api`, or set CML_API_URL."
                             )
-                        except Exception as e:
-                            st.error(f"Error during scoring: {e}")
 
             else:
                 st.error("Validation failed.")
@@ -228,29 +222,35 @@ elif page == "Upload & Analyze":
 
     # Display Results if available
     if st.session_state["analysis_results"]:
-        results = st.session_state["analysis_results"]["results"]
-        res_df = pd.DataFrame(results)
+        analysis = st.session_state["analysis_results"]
+        res_df = pd.DataFrame(analysis["results"])
 
         st.subheader("Optimization Recommendations")
 
+        # The API caps the rows it returns. Say so, rather than presenting
+        # counts over the first 100 rows as if they covered the dataset.
+        if analysis.get("results_truncated"):
+            st.info(
+                f"Showing the first {len(res_df)} of {analysis['total_results']} scored "
+                "CMLs. The counts below cover the displayed rows only."
+            )
+
         col1, col2 = st.columns(2)
         with col1:
-            elim_count = len(res_df[res_df["predicted_elimination_flag"] == 1])
+            elim_count = int((res_df["predicted_elimination_flag"] == 1).sum())
             st.metric(
                 "Candidates for Elimination",
                 elim_count,
                 delta="Optimization Opportunity",
             )
         with col2:
-            keep_count = len(res_df[res_df["predicted_elimination_flag"] == 0])
+            keep_count = int((res_df["predicted_elimination_flag"] == 0).sum())
             st.metric("Critical Monitoring Points", keep_count)
 
         st.dataframe(
             res_df.style.apply(
                 lambda x: [
-                    "background-color: #3d0000"
-                    if x.predicted_elimination_flag == 1
-                    else ""
+                    "background-color: #3d0000" if x.predicted_elimination_flag == 1 else ""
                     for i in x
                 ],
                 axis=1,
@@ -345,9 +345,7 @@ elif page == "Forecasting":
                 0.5,
             )
         with col2:
-            safety_factor = st.number_input(
-                "Safety Factor", 1.0, 3.0, DEFAULT_SAFETY_FACTOR, 0.1
-            )
+            safety_factor = st.number_input("Safety Factor", 1.0, 3.0, DEFAULT_SAFETY_FACTOR, 0.1)
 
         if st.button("Generate Forecasts", type="primary"):
             try:
@@ -379,21 +377,20 @@ elif page == "SME Overrides":
         "Record and track manual engineering decisions that deviate from model recommendations."
     )
 
-    with st.expander("Add New Override", expanded=False):
-        with st.form("override_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                cml_id = st.text_input("CML ID", placeholder="CML-001")
-                decision = st.selectbox("Decision", ["KEEP", "ELIMINATE"])
-            with col2:
-                sme_name = st.text_input("SME Name", placeholder="Dr. John Smith")
+    with st.expander("Add New Override", expanded=False), st.form("override_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            cml_id = st.text_input("CML ID", placeholder="CML-001")
+            decision = st.selectbox("Decision", ["KEEP", "ELIMINATE"])
+        with col2:
+            sme_name = st.text_input("SME Name", placeholder="Dr. John Smith")
 
-            reason = st.text_area("Reason for Override", height=100)
-            submitted = st.form_submit_button("Submit Override")
+        reason = st.text_area("Reason for Override", height=100)
+        submitted = st.form_submit_button("Submit Override")
 
-            if submitted and cml_id and reason:
-                sme_manager.add_override(cml_id, decision, reason, sme_name)
-                st.success("Override recorded.")
+        if submitted and cml_id and reason:
+            sme_manager.add_override(cml_id, decision, reason, sme_name)
+            st.success("Override recorded.")
 
     # Show overrides
     overrides = sme_manager.get_all_overrides()
@@ -412,13 +409,13 @@ elif page == "Reports":
         # Try to import advanced analytics
         try:
             from app.advanced_analytics import (
-                create_risk_matrix_heatmap,
-                create_remaining_life_distribution,
-                create_corrosion_by_commodity_chart,
-                create_inspection_priority_scatter,
-                create_feature_type_analysis,
-                create_corrosion_trend_gauge,
                 calculate_advanced_statistics,
+                create_corrosion_by_commodity_chart,
+                create_corrosion_trend_gauge,
+                create_feature_type_analysis,
+                create_inspection_priority_scatter,
+                create_remaining_life_distribution,
+                create_risk_matrix_heatmap,
                 create_timeline_forecast_chart,
             )
 
@@ -436,10 +433,7 @@ elif page == "Reports":
                 avg_life = df["remaining_life_years"].mean()
             else:
                 avg_life = (
-                    (
-                        (df["thickness_mm"] - 3.0)
-                        / df["average_corrosion_rate"].clip(lower=0.01)
-                    )
+                    ((df["thickness_mm"] - 3.0) / df["average_corrosion_rate"].clip(lower=0.01))
                     .clip(0, 50)
                     .mean()
                 )
@@ -510,9 +504,7 @@ elif page == "Reports":
                 st.markdown("**Remaining Life Metrics**")
                 st.write(f"- Mean: {stats['remaining_life']['mean']:.1f} years")
                 st.write(f"- Median: {stats['remaining_life']['median']:.1f} years")
-                st.write(
-                    f"- 10th Percentile: {stats['remaining_life']['percentile_10']:.1f} years"
-                )
+                st.write(f"- 10th Percentile: {stats['remaining_life']['percentile_10']:.1f} years")
             with col2:
                 st.markdown("**Risk Distribution**")
                 st.write(f"- Critical: {stats['risk_distribution']['critical']} CMLs")
@@ -523,9 +515,7 @@ elif page == "Reports":
                 st.write(
                     f"- Immediate Attention: {stats['inspection_scheduling']['immediate_attention']}"
                 )
-                st.write(
-                    f"- Next 6 Months: {stats['inspection_scheduling']['next_6_months']}"
-                )
+                st.write(f"- Next 6 Months: {stats['inspection_scheduling']['next_6_months']}")
                 st.write(
                     f"- Avg Interval: {stats['inspection_scheduling']['avg_interval_months']:.0f} months"
                 )

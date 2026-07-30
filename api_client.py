@@ -1,67 +1,89 @@
+"""HTTP client the Streamlit dashboard uses to reach the scoring API.
+
+The base URL comes from the ``CML_API_URL`` environment variable so the
+dashboard can point at a container, a staging host or a local server
+without editing code. The port previously moved between 8000 and 8002
+across three commits precisely because it was hardcoded here.
+
+This module deliberately raises instead of rendering errors: presentation
+belongs to the dashboard, and keeping Streamlit out of here makes the
+client testable and reusable from scripts.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
 import requests
-from typing import Optional, Dict, Any
-import streamlit as st
 
-API_BASE_URL = "http://localhost:8000"
+DEFAULT_API_URL = "http://localhost:8000"
+HEALTH_TIMEOUT_SECONDS = 5
+SCORE_TIMEOUT_SECONDS = 120
 
 
-def check_api_health() -> bool:
-    """Check if API is available."""
+class APIError(RuntimeError):
+    """The API was unreachable or returned an error response."""
+
+
+def get_api_base_url() -> str:
+    """Return the configured API base URL, without a trailing slash."""
+    return os.environ.get("CML_API_URL", DEFAULT_API_URL).rstrip("/")
+
+
+def check_api_health(timeout: int = HEALTH_TIMEOUT_SECONDS) -> bool:
+    """Return True when the API answers its health probe."""
     try:
-        response = requests.get(f"{API_BASE_URL}/health", timeout=2)
-        return response.status_code == 200
-    except:
+        response = requests.get(f"{get_api_base_url()}/health", timeout=timeout)
+    except requests.RequestException:
         return False
+    return response.status_code == 200
 
 
-def score_cml_data(uploaded_file) -> Optional[Dict[str, Any]]:
-    """Score CML data via API.
+def score_cml_data(uploaded_file, timeout: int = SCORE_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """Score an uploaded CML file through the API.
 
     Args:
-        uploaded_file: Streamlit UploadedFile object
+        uploaded_file: A Streamlit ``UploadedFile`` (anything exposing
+            ``name``, ``type`` and ``getvalue()`` works).
+        timeout: Seconds to wait for the response.
 
     Returns:
-        API response as dict or None on error
+        The decoded JSON response body.
+
+    Raises:
+        APIError: On connection failure, timeout, or a non-2xx response.
+            The API's own error detail is included in the message when the
+            body carries one.
     """
+    base_url = get_api_base_url()
+    mime_type = getattr(uploaded_file, "type", None) or "application/octet-stream"
+    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), mime_type)}
+
     try:
-        # Robust MIME type handling
-        mime_type = (
-            uploaded_file.type if uploaded_file.type else "application/octet-stream"
-        )
+        response = requests.post(f"{base_url}/score-cml-data", files=files, timeout=timeout)
+    except requests.ConnectionError as exc:
+        raise APIError(
+            f"Cannot reach the API at {base_url}. Is it running? "
+            f"Set CML_API_URL if it listens elsewhere."
+        ) from exc
+    except requests.Timeout as exc:
+        raise APIError(f"The API did not respond within {timeout}s.") from exc
+    except requests.RequestException as exc:
+        raise APIError(f"Request to {base_url} failed: {exc}") from exc
 
-        files = {"file": (uploaded_file.name, uploaded_file.getvalue(), mime_type)}
+    if not response.ok:
+        raise APIError(f"API returned {response.status_code}: {_error_detail(response)}")
 
-        # Log upload attempt
-        print(
-            f"Uploading {uploaded_file.name} ({len(uploaded_file.getvalue())} bytes, type={mime_type})"
-        )
+    return response.json()
 
-        response = requests.post(
-            f"{API_BASE_URL}/score-cml-data", files=files, timeout=60
-        )
 
-        if response.status_code == 422:
-            st.error(f"Validation Error: {response.text}")
-            return None
-
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.ConnectionError:
-        st.error(
-            "Cannot connect to API. Make sure the API server is running on http://localhost:8000"
-        )
-        return None
-    except requests.exceptions.Timeout:
-        st.error("API request timed out. Please try again.")
-        return None
-    except requests.exceptions.HTTPError as e:
-        st.error(f"API Error: {e}")
-        try:
-            # Try to print more detail if available
-            st.code(response.text)
-        except:
-            pass
-        return None
-    except Exception as e:
-        st.error(f"Unexpected Error: {str(e)}")
-        return None
+def _error_detail(response: requests.Response) -> str:
+    """Pull FastAPI's ``detail`` out of an error body, falling back to raw text."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:500]
+    if isinstance(payload, dict) and "detail" in payload:
+        return str(payload["detail"])
+    return str(payload)[:500]

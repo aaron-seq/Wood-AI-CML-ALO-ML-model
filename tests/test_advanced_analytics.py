@@ -1,20 +1,21 @@
 """Tests for the advanced analytics module."""
 
-import pytest
-import pandas as pd
 import sys
 from pathlib import Path
+
+import pandas as pd
+import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from app.advanced_analytics import (
-    create_risk_matrix_heatmap,
-    create_remaining_life_distribution,
-    create_corrosion_by_commodity_chart,
-    create_inspection_priority_scatter,
-    create_feature_type_analysis,
-    create_corrosion_trend_gauge,
     calculate_advanced_statistics,
+    create_corrosion_by_commodity_chart,
+    create_corrosion_trend_gauge,
+    create_feature_type_analysis,
+    create_inspection_priority_scatter,
+    create_remaining_life_distribution,
+    create_risk_matrix_heatmap,
     create_timeline_forecast_chart,
 )
 
