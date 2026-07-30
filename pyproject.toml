@@ -1,0 +1,63 @@
+[project]
+name = "wood-cml-alo"
+version = "1.0.0"
+description = "ML-assisted Condition Monitoring Location (CML) optimisation for pipework inspection programmes"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app", "ml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", "models", "data"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # import sorting
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "C4",  # comprehensions
+    "SIM", # simplify
+]
+ignore = [
+    "B008", # FastAPI's File(...)/Depends(...) defaults are the documented idiom
+    "E501", # long lines are reported by the formatter, not the linter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--verbose --color=yes --tb=short --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+filterwarnings = [
+    # A model pickled by a different scikit-learn minor version is a
+    # deployment error, not a test-time nuisance -- fail loudly if it
+    # reappears after a dependency bump.
+    "error::sklearn.exceptions.InconsistentVersionWarning",
+]
+
+[tool.coverage.run]
+source = ["app", "ml"]
+omit = ["*/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
