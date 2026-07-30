@@ -1,11 +1,59 @@
-version: '3.9'
+# Brings up the API and the dashboard together.
+#
+#   docker compose up --build
+#     API        http://localhost:8000/docs
+#     Dashboard  http://localhost:8501
+#
+# The source tree is baked into the image rather than bind-mounted, so
+# the containers run the code that was built. For live reload while
+# developing, use `make dev` instead.
+
 services:
   api:
-    build: .
+    build:
+      context: .
+      args:
+        TARGET: api
     container_name: wood-cml-api
     ports:
       - "8000:8000"
-    volumes:
-      - ./:/app
     environment:
-      - PYTHONUNBUFFERED=1
+      LOG_LEVEL: INFO
+      ENVIRONMENT: docker
+      CORS_ORIGINS: http://localhost:8501
+    # Overrides and SME decisions are the only mutable state; keeping
+    # them in a named volume means they survive a rebuild.
+    volumes:
+      - cml-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      args:
+        TARGET: dashboard
+    container_name: wood-cml-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      # Reaches the API over the compose network, not localhost.
+      CML_API_URL: http://api:8000
+    command:
+      - streamlit
+      - run
+      - streamlit_app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  cml-data:
