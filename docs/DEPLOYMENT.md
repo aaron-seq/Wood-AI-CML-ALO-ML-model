@@ -32,6 +32,18 @@ docker run -p 8000:8000 wood-cml-api
 
 `TARGET=dashboard` installs the UI stack instead.
 
+## Dependency and security checks
+
+```bash
+make audit      # pip-audit over everything installed; fails on any known CVE
+make typecheck  # mypy over app/ and ml/
+make check      # lint, types, audit and tests -- what CI runs
+```
+
+CI runs the audit as its own job, and Dependabot opens a grouped weekly PR.
+scikit-learn is excluded from those updates on purpose: bumping it requires
+retraining the committed pickle (see below).
+
 ## Configuration
 
 Every setting has a working default; see [`.env.example`](../.env.example) for
@@ -60,9 +72,10 @@ Before exposing this to users:
 - [ ] **Size memory** against `MAX_UPLOAD_BYTES` × workers, with headroom for
       the parsed DataFrame (several times the file size).
 - [ ] **Persist `data/`** on a real volume. Losing it loses the SME audit trail.
-- [ ] **Run one replica, or move overrides to a database first.** The JSON store
-      rewrites the whole file per write with no locking, so concurrent writes
-      across replicas can interleave and lose a decision.
+- [ ] **Run one replica, or move overrides to a database first.** Writes are
+      atomic and guarded by an advisory lock, which makes concurrent writers
+      on a *single host* safe. The lock does not coordinate across hosts or
+      over a network filesystem.
 - [ ] **Wire `/health` to your orchestrator's liveness and readiness probes.**
       Treat `status: degraded` as not-ready.
 - [ ] **Ship logs somewhere queryable.** Correlate client reports by the
@@ -147,10 +160,14 @@ Ordered by what most limits production readiness:
 2. **Authentication and authorisation**, so overrides are attributable to an
    identity rather than a free-text `sme_name`.
 3. **Move overrides to a database** with row-level locking; removes the
-   single-writer constraint.
+   single-host constraint that the advisory lock leaves in place.
 4. **Calibrate probabilities** (`CalibratedClassifierCV`) so
    `elimination_probability` can be read as a probability and the confidence
    label means something checkable.
 5. **Stream or queue large uploads** instead of parsing them in-request.
 6. **Metrics and tracing** — Prometheus counters and OpenTelemetry spans.
    Request ids are already threaded through, which is the prerequisite.
+7. **Per-circuit minimum thickness.** `app/risk.py` uses one global 3.0 mm
+   floor; real programmes derive it per circuit from design pressure and
+   material, which would also let the risk thresholds be calibrated rather
+   than inherited.

@@ -11,7 +11,7 @@ override system exists because an engineer, not the model, owns the call.
 
 [![CI](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
-![Coverage](https://img.shields.io/badge/coverage-87%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-88%25-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -23,7 +23,7 @@ git clone https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model.git
 cd Wood-AI-CML-ALO-ML-model
 
 make setup   # create .venv and install everything
-make test    # 138 tests, should pass in ~20s
+make test    # 169 tests, should pass in ~15s
 make dev     # API on :8000, dashboard on :8501
 ```
 
@@ -81,7 +81,7 @@ Full reference with request and response bodies:
 | `GET` | `/health` | Liveness and model-loaded status |
 | `GET` | `/model/info` | Loaded estimator and its feature columns |
 | `POST` | `/upload-cml-data` | Parse and validate a file without scoring it |
-| `POST` | `/score-cml-data` | Score every CML for elimination |
+| `POST` | `/score-cml-data` | Score every CML, applying any expert overrides |
 | `POST` | `/forecast-remaining-life` | Remaining life and next inspection date |
 | `POST` | `/generate-report` | Aggregated elimination analysis |
 | `GET` | `/sme-override` | List overrides and agreement statistics |
@@ -96,6 +96,10 @@ curl -X POST http://localhost:8000/score-cml-data \
 `/score-cml-data` echoes at most 100 results in the body. `total_results`
 always reports the true count and `results_truncated` says whether the list
 is partial.
+
+Recorded expert decisions supersede the model: `recommendation` is the
+decision to act on, `model_recommendation` is what the model said on its
+own, and `sme_override` names who overruled it and why.
 
 ---
 
@@ -172,6 +176,7 @@ app/                      FastAPI application
   main.py                 All routes; the single entry point
   config.py               Settings (env / .env driven)
   features.py             Shared feature engineering (API + training)
+  risk.py                 Risk classification and inspection intervals
   ingestion.py            Upload validation and parsing
   forecasting.py          Remaining-life and inspection scheduling
   sme_override.py         Expert override store
@@ -181,7 +186,7 @@ app/                      FastAPI application
 ml/train_enhanced.py      Training pipeline with grid search
 streamlit_app.py          Dashboard
 api_client.py             Dashboard's HTTP client
-tests/                    138 tests
+tests/                    169 tests
 docs/                     Architecture, API, deployment, model card, ADRs
 ```
 
@@ -190,12 +195,14 @@ docs/                     Architecture, API, deployment, model card, ADRs
 ## Development
 
 ```bash
-make check   # exactly what CI runs: lint + format + tests
-make format  # apply formatting and safe fixes
-make test    # tests with a coverage report
+make check      # exactly what CI runs: lint, types, audit, tests
+make format     # apply formatting and safe fixes
+make typecheck  # mypy over app/ and ml/
+make audit      # fail on any known CVE in a shipped dependency
 ```
 
-Ruff handles linting and formatting; configuration is in `pyproject.toml`.
+`make check` runs ruff (lint + format), mypy, pip-audit and the tests.
+Configuration for all of them is in `pyproject.toml`.
 See [CONTRIBUTING.md](CONTRIBUTING.md) and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -221,9 +228,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
   performance.
 - **No authentication.** Any client that can reach the port can score data and
   write SME overrides. Deploy behind an authenticating gateway.
-- **Overrides are stored in a JSON file**, rewritten in full on each write.
-  There is no locking, so concurrent writes can interleave; adequate for a
-  single instance, not for a scaled-out deployment.
+- **Overrides are stored in a JSON file**, written atomically and guarded by
+  an advisory lock. That makes a single host safe; it does not coordinate
+  across hosts, so run one replica until the store moves to a database.
 - **Uploads are parsed entirely in memory.** The size limit is the memory
   bound; size container limits accordingly.
 - **`elimination_probability` is a Random Forest vote share**, not a calibrated

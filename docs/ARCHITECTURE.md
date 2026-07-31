@@ -72,9 +72,10 @@ condition that previously caused train/serve skew (see
 | `app/config.py` | Settings from env/`.env`, path resolution | — |
 | `app/ingestion.py` | Upload size/format/parse; `UploadError` | pandas |
 | `app/features.py` | Engineered feature columns | pandas, numpy |
+| `app/risk.py` | Risk level and inspection interval, shared by all surfaces | pandas, numpy |
 | `app/utils.py` | Dataframe validation, inspection schedule, reports | pandas |
-| `app/forecasting.py` | `CMLForecaster`: life, intervals, risk levels | `app.features` |
-| `app/sme_override.py` | Override persistence and statistics | pandas |
+| `app/forecasting.py` | `CMLForecaster`: life, intervals, risk levels | `app.features`, `app.risk` |
+| `app/sme_override.py` | Override persistence (atomic + locked) and statistics | pandas |
 | `app/advanced_analytics.py` | Plotly figures and dataset statistics | `app.features`, plotly |
 | `app/schemas.py` | Request/response contracts | pydantic |
 
@@ -93,6 +94,7 @@ sequenceDiagram
     participant V as utils.validate
     participant F as features
     participant P as sklearn Pipeline
+    participant S as sme_override
 
     C->>M: POST multipart file
     M->>M: assign x-request-id
@@ -120,8 +122,10 @@ sequenceDiagram
         R-->>C: 500 (logged with traceback)
     end
     P-->>R: flags + probabilities
-    R->>R: zip positionally, truncate to 100
-    R-->>C: 200 results, total_results, results_truncated
+    R->>S: get_override_map()
+    S-->>R: expert decisions by CML id
+    R->>R: zip positionally; override wins where recorded
+    R-->>C: 200 results, total_results, sme_overrides_applied
 ```
 
 The distinction that matters: anything the caller can fix is a `400` carrying
@@ -218,6 +222,8 @@ Recorded as ADRs in [`adr/`](adr/):
 | [0002](adr/0002-pin-dependencies-to-the-model-artifact.md) | Pin dependencies to the model artifact's scikit-learn |
 | [0003](adr/0003-share-feature-engineering-between-training-and-serving.md) | Share feature engineering across training and serving |
 | [0004](adr/0004-centralise-upload-validation.md) | Centralise upload validation; client errors are 400s |
+| [0005](adr/0005-single-risk-classifier.md) | One risk classifier, and it is the conservative one |
+| [0006](adr/0006-overrides-supersede-the-model.md) | Expert overrides supersede the model in the response |
 
 ## Conventions
 

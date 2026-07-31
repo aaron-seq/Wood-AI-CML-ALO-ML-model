@@ -132,12 +132,15 @@ curl -X POST http://localhost:8000/score-cml-data -F "file=@data/cml_sample_500.
       "id_number": "CML-001",
       "predicted_elimination_flag": 0,
       "elimination_probability": 0.23,
+      "model_recommendation": "KEEP",
       "recommendation": "KEEP",
-      "confidence": "HIGH"
+      "confidence": "HIGH",
+      "sme_override": null
     }
   ],
   "total_results": 500,
   "results_truncated": true,
+  "sme_overrides_applied": 0,
   "model_info": { "model_type": "Pipeline", "features_used": ["..."] },
   "message": "Successfully scored 500 CML records"
 }
@@ -145,9 +148,12 @@ curl -X POST http://localhost:8000/score-cml-data -F "file=@data/cml_sample_500.
 
 | Field | Notes |
 | --- | --- |
-| `predicted_elimination_flag` | `0` keep, `1` eliminate |
+| `predicted_elimination_flag` | Raw model output: `0` keep, `1` eliminate |
 | `elimination_probability` | Random Forest vote share in `[0, 1]`. **Not calibrated** — do not read it as a true probability |
-| `recommendation` | `KEEP` or `ELIMINATE`; always agrees with the flag |
+| `model_recommendation` | What the model alone said; always agrees with the flag |
+| `recommendation` | **The decision to act on.** Equals `model_recommendation` unless an expert has overruled it |
+| `sme_override` | `null`, or the expert decision with who recorded it, when and why |
+| `sme_overrides_applied` | How many rows in the batch carried an override |
 | `confidence` | `HIGH` when more than 0.3 from the 0.5 boundary, else `MODERATE`. A distance measure, not a validated interval |
 | `results` | Capped at 100 entries |
 | `total_results` | The true count, always |
@@ -177,9 +183,23 @@ deterministic arithmetic, so it works even when the API is degraded.
 ]
 ```
 
-`risk_level` comes from remaining life: `CRITICAL` under 2 years, `HIGH` under
-5, `MEDIUM` under 10, otherwise `LOW`. Intervals are clamped to 1–6 years
-after the safety factor. A row with unusable values is skipped and logged with
+`risk_level` comes from `app/risk.py`, the single classifier shared with the
+dashboard and the analytics charts. A CML takes a level if **any** of its
+conditions holds:
+
+| Level | Conditions |
+| --- | --- |
+| `CRITICAL` | remaining life < 1 year, **or** wall thinner than 5 mm |
+| `HIGH` | remaining life < 3 years, **or** rate > 0.25 mm/yr |
+| `MEDIUM` | remaining life < 7 years, **or** rate > 0.15 mm/yr |
+| `LOW` | none of the above |
+
+Thickness is part of the test on purpose: a wall near its minimum has
+almost no material left however slowly it is corroding, and a
+remaining-life-only rule scored exactly that case as `LOW`.
+
+Intervals are clamped to 1–6 years after the safety factor, shortened for
+CMLs corroding faster than 0.20 mm/yr and extended below 0.05 mm/yr. A row with unusable values is skipped and logged with
 a count rather than failing the batch.
 
 ---
@@ -218,6 +238,11 @@ engineer's attention: the model is closest to indifferent there.
 
 Expert decisions that supersede the model, kept as an audit trail. Keyed by
 CML id.
+
+Overrides are applied automatically. Once an expert records a decision for
+a CML, every later scoring run returns it as the `recommendation` while
+still reporting the model's own view in `model_recommendation` — the
+override does not erase the audit trail.
 
 ### `POST /sme-override` → `201`
 

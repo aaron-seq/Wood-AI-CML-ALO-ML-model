@@ -4,7 +4,7 @@
 
 ```bash
 make setup   # .venv + all dependencies
-make check   # lint + format + tests — exactly what CI runs
+make check   # lint, types, audit, tests — exactly what CI runs
 ```
 
 `make help` lists every target. Use them rather than raw `pytest`/`ruff`
@@ -47,6 +47,11 @@ applies them. Beyond that:
 - **Feature engineering goes in `app/features.py`**, which the API, the trainer
   and the analytics module all share. Do not add a local copy of a formula
   ([ADR-0003](docs/adr/0003-share-feature-engineering-between-training-and-serving.md)).
+- **Risk levels and inspection intervals come from `app/risk.py`.** Three
+  copies of that logic drifted into disagreeing on 70% of CMLs
+  ([ADR-0005](docs/adr/0005-single-risk-classifier.md)).
+- **Type annotations are checked.** `make typecheck` must pass; new modules
+  should be fully annotated.
 
 ## Before adding code
 
@@ -67,7 +72,8 @@ Say so explicitly in the PR, and include a rollback plan:
 | `scikit-learn` pin | Requires retraining — the artifact is a pickle. Follow [DEPLOYMENT.md](docs/DEPLOYMENT.md#upgrading-scikit-learn) and commit requirements, artifact and metadata together |
 | Upload limits | These bound worker memory |
 | CORS or anything auth-adjacent | Security surface |
-| SME override storage format | Existing audit trails must stay readable |
+| SME override storage format | Existing audit trails must stay readable, and writes must stay atomic |
+| Risk thresholds in `app/risk.py` | Changes what gets inspected and when |
 | CI or Dockerfile | Affects everything downstream |
 
 ## Architecture decisions
