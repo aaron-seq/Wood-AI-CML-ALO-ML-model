@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 
 # Configure logging
@@ -21,7 +22,9 @@ logger = logging.getLogger(__name__)
 # Use proper imports
 try:
     from api_client import APIError, check_api_health, get_api_base_url, score_cml_data
+    from app.config import settings
     from app.forecasting import CMLForecaster
+    from app.ingestion import UploadError, parse_bytes
     from app.sme_override import SMEOverrideManager
     from app.utils import validate_cml_dataframe
 except ImportError as e:
@@ -112,16 +115,52 @@ def get_sme_manager() -> SMEOverrideManager:
     return SMEOverrideManager()
 
 
-def read_uploaded_file(uploaded_file) -> pd.DataFrame | None:
+def get_model_description(api_online: bool) -> str:
+    """Describe the model the API is serving, or why we cannot tell."""
+    if not api_online:
+        return "Unknown"
     try:
-        if uploaded_file.name.endswith(".csv"):
-            return pd.read_csv(uploaded_file)
-        elif uploaded_file.name.endswith((".xlsx", ".xls")):
-            return pd.read_excel(uploaded_file)
+        response = requests.get(f"{get_api_base_url()}/model/info", timeout=5)
+    except requests.RequestException:
+        return "Unknown"
+    if response.status_code == 503:
+        return "Not loaded"
+    if not response.ok:
+        return "Unknown"
+    info = response.json()
+    return f"{info['model_type']} ({len(info['features_used'])} features)"
+
+
+def read_uploaded_file(uploaded_file) -> pd.DataFrame | None:
+    """Parse an upload through the same code path the API uses.
+
+    This previously called pandas directly, so the dashboard accepted
+    files the API would reject -- no size limit, no row limit, and
+    different error messages for the same bad file.
+    """
+    payload = uploaded_file.getvalue()
+
+    if len(payload) > settings.MAX_UPLOAD_BYTES:
+        st.error(
+            f"File is too large ({len(payload) / 1_048_576:.1f} MB). "
+            f"The limit is {settings.MAX_UPLOAD_BYTES / 1_048_576:.0f} MB."
+        )
         return None
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
+
+    try:
+        frame = parse_bytes(payload, uploaded_file.name)
+    except UploadError as exc:
+        st.error(str(exc))
         return None
+
+    if len(frame) > settings.MAX_UPLOAD_ROWS:
+        st.error(
+            f"File contains {len(frame):,} rows, which exceeds the "
+            f"{settings.MAX_UPLOAD_ROWS:,} row limit."
+        )
+        return None
+
+    return frame
 
 
 try:
@@ -143,7 +182,9 @@ if page == "Overview":
         if not api_up:
             st.caption(f"No response from {get_api_base_url()}")
     with col2:
-        st.metric("Model Version", "RF-Ensemble v2.1")
+        # Report what is actually loaded rather than a hardcoded string.
+        # "RF-Ensemble v2.1" was not a real version of anything.
+        st.metric("Model", get_model_description(api_up))
     with col3:
         if st.session_state["data"] is not None:
             st.metric("Active Dataset", f"{len(st.session_state['data'])} Records")
