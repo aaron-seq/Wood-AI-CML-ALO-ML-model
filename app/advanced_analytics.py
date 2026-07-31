@@ -17,6 +17,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from app import risk
 from app.features import MAX_REMAINING_LIFE_YEARS, remaining_life_years
 
 
@@ -243,10 +244,8 @@ def create_inspection_priority_scatter(df: pd.DataFrame) -> go.Figure:
     df["remaining_life_years"] = _remaining_life(df)
 
     # Create risk categories
-    df["risk_category"] = pd.cut(
-        df["remaining_life_years"],
-        bins=[0, 2, 5, 10, float("inf")],
-        labels=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+    df["risk_category"] = risk.classify_series(
+        df["remaining_life_years"], df["average_corrosion_rate"], df["thickness_mm"]
     )
 
     color_map = {
@@ -309,10 +308,8 @@ def create_feature_type_analysis(df: pd.DataFrame) -> go.Figure:
     # Create hierarchical data
     df = df.copy()
     if "risk_category" not in df.columns:
-        df["risk_category"] = pd.cut(
-            _remaining_life(df),
-            bins=[0, 2, 5, 10, float("inf")],
-            labels=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+        df["risk_category"] = risk.classify_series(
+            _remaining_life(df), df["average_corrosion_rate"], df["thickness_mm"]
         )
 
     fig = px.sunburst(
@@ -461,11 +458,10 @@ def calculate_advanced_statistics(df: pd.DataFrame) -> dict[str, Any]:
     """
     remaining_life = _remaining_life(df)
 
-    # Risk categorization
-    risk_counts = pd.cut(
-        remaining_life,
-        bins=[0, 2, 5, 10, float("inf")],
-        labels=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+    # Risk categorization, via the shared classifier so these counts
+    # agree with the risk levels the API and the dashboard report.
+    risk_counts = risk.classify_series(
+        remaining_life, df["average_corrosion_rate"], df["thickness_mm"]
     ).value_counts()
 
     # Calculate inspection intervals based on API 570
