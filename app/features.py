@@ -29,6 +29,13 @@ DEFAULT_DAYS_SINCE_INSPECTION = 365
 #: Columns a caller must supply before features can be engineered.
 BASE_NUMERIC_COLUMNS = ("average_corrosion_rate", "thickness_mm")
 
+#: Optional per-row minimum allowable thickness. Real inspection
+#: programmes derive this per circuit from design pressure and material,
+#: so a single global floor is a simplification. When the column is
+#: present it wins, row by row; when it is absent the global default
+#: applies, which is the historical behaviour.
+MINIMUM_THICKNESS_COLUMN = "minimum_thickness_mm"
+
 #: Columns this module adds to a CML frame.
 ENGINEERED_COLUMNS = (
     "corrosion_thickness_ratio",
@@ -38,10 +45,27 @@ ENGINEERED_COLUMNS = (
 )
 
 
+def resolve_minimum_thickness(
+    df: pd.DataFrame, default: float = DEFAULT_MINIMUM_THICKNESS_MM
+) -> pd.Series:
+    """Per-row minimum allowable thickness.
+
+    Uses :data:`MINIMUM_THICKNESS_COLUMN` where the caller supplies it and
+    the value is usable, falling back to ``default`` elsewhere. A
+    non-positive or unparseable entry falls back rather than producing a
+    nonsensical remaining life.
+    """
+    if MINIMUM_THICKNESS_COLUMN not in df.columns:
+        return pd.Series(float(default), index=df.index, dtype="float64")
+
+    supplied = pd.to_numeric(df[MINIMUM_THICKNESS_COLUMN], errors="coerce")
+    return supplied.where(supplied > 0, float(default)).astype("float64")
+
+
 def remaining_life_years(
     thickness_mm: pd.Series,
     corrosion_rate: pd.Series,
-    minimum_thickness_mm: float = DEFAULT_MINIMUM_THICKNESS_MM,
+    minimum_thickness_mm: float | pd.Series = DEFAULT_MINIMUM_THICKNESS_MM,
 ) -> pd.Series:
     """Years until ``thickness_mm`` corrodes down to ``minimum_thickness_mm``.
 
@@ -110,8 +134,11 @@ def engineer_features(
 
     Args:
         df: CML records containing at least the columns in
-            :data:`BASE_NUMERIC_COLUMNS`.
-        minimum_thickness_mm: Minimum allowable wall thickness.
+            :data:`BASE_NUMERIC_COLUMNS`. An optional
+            :data:`MINIMUM_THICKNESS_COLUMN` overrides the default floor
+            per row.
+        minimum_thickness_mm: Fallback minimum allowable wall thickness,
+            used for rows that do not supply their own.
         now: Reference time for inspection-age calculations; defaults to
             the current time. Injectable so tests are deterministic.
 
@@ -126,6 +153,7 @@ def engineer_features(
         raise KeyError(f"Missing required column(s): {', '.join(missing)}")
 
     out = df.copy()
+    minimum_thickness = resolve_minimum_thickness(out, minimum_thickness_mm)
     out["corrosion_thickness_ratio"] = corrosion_thickness_ratio(
         out["average_corrosion_rate"], out["thickness_mm"]
     )
@@ -141,12 +169,12 @@ def engineer_features(
             out["remaining_life_years"], errors="coerce"
         ).fillna(
             remaining_life_years(
-                out["thickness_mm"], out["average_corrosion_rate"], minimum_thickness_mm
+                out["thickness_mm"], out["average_corrosion_rate"], minimum_thickness
             )
         )
     else:
         out["remaining_life_years"] = remaining_life_years(
-            out["thickness_mm"], out["average_corrosion_rate"], minimum_thickness_mm
+            out["thickness_mm"], out["average_corrosion_rate"], minimum_thickness
         )
 
     if "last_inspection_date" in out.columns:

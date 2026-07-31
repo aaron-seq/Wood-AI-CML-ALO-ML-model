@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from app import risk
-from app.features import MAX_REMAINING_LIFE_YEARS
+from app.features import MAX_REMAINING_LIFE_YEARS, MINIMUM_THICKNESS_COLUMN
 
 
 class CMLForecaster:
@@ -141,12 +141,20 @@ class CMLForecaster:
                 except Exception:
                     pass  # Use None if date parsing fails
 
+            # A per-row minimum allowable thickness, where the source
+            # data carries one, beats both the argument and the instance
+            # default -- real programmes set this per circuit.
+            row_minimum = minimum_thickness
+            supplied = row.get(MINIMUM_THICKNESS_COLUMN)
+            if supplied is not None and pd.notna(supplied) and float(supplied) > 0:
+                row_minimum = float(supplied)
+
             forecast = self.forecast_single_cml(
                 id_number=row.get("id_number", f"CML-{len(forecasts) + 1}"),
                 current_thickness=row["thickness_mm"],
                 corrosion_rate=row["average_corrosion_rate"],
                 last_inspection_date=last_inspection,
-                minimum_thickness=minimum_thickness,
+                minimum_thickness=row_minimum,
             )
             forecasts.append(forecast)
 
