@@ -152,6 +152,36 @@ def _require_model() -> Any:
     return model
 
 
+def _override_summary(override: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Reduce a stored override to the fields a scoring response needs."""
+    if override is None:
+        return None
+    return {
+        "sme_decision": override["sme_decision"],
+        "sme_name": override.get("sme_name"),
+        "reason": override.get("reason"),
+        "override_date": override.get("override_date"),
+    }
+
+
+def _json_safe_preview(df: pd.DataFrame, rows: int = 5) -> list[dict[str, Any]]:
+    """First few rows as JSON-serialisable records.
+
+    NaN is not valid JSON, so missing cells are emitted as null rather
+    than as a float the client cannot parse.
+    """
+    preview = df.head(rows).astype(object)
+    return [
+        {
+            str(column): None
+            if value is None or (isinstance(value, float) and pd.isna(value))
+            else value
+            for column, value in record.items()
+        }
+        for record in preview.to_dict("records")
+    ]
+
+
 def _feature_columns(loaded_model: Any) -> list[str]:
     names = getattr(loaded_model, "feature_names_in_", None)
     return list(names) if names is not None else list(_FALLBACK_FEATURE_COLUMNS)
@@ -203,9 +233,7 @@ async def upload_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
         "filename": file.filename,
         "rows": len(df),
         "columns": list(df.columns),
-        # NaN is not valid JSON; converting to None keeps the preview
-        # serialisable for frames with missing cells.
-        "preview": df.head(5).astype(object).where(pd.notna(df.head(5)), None).to_dict("records"),
+        "preview": _json_safe_preview(df),
         "message": f"Successfully parsed {len(df)} records",
         "validation": validation,
     }
@@ -248,25 +276,46 @@ async def score_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
     # which are only interchangeable with positions for a default
     # RangeIndex, and predictions are positional numpy arrays.
     ids = features["id_number"].astype(str).tolist()
-    results = [
-        {
-            "id_number": ids[position],
-            "predicted_elimination_flag": int(predictions[position]),
-            "elimination_probability": float(probabilities[position]),
-            "recommendation": "ELIMINATE" if predictions[position] == 1 else "KEEP",
-            "confidence": "HIGH"
-            if abs(probabilities[position] - 0.5) > HIGH_CONFIDENCE_MARGIN
-            else "MODERATE",
-        }
-        for position in range(len(features))
-    ]
 
-    logger.info("Scored %d CMLs from %s", len(results), file.filename)
+    # Expert decisions supersede the model. Until now the override store
+    # was written but never read back into a scoring run, so an engineer
+    # could record "KEEP this CML" and the next run still said ELIMINATE.
+    overrides = sme_manager.get_override_map()
+
+    results = []
+    for position in range(len(features)):
+        model_recommendation = "ELIMINATE" if predictions[position] == 1 else "KEEP"
+        override = overrides.get(ids[position])
+        results.append(
+            {
+                "id_number": ids[position],
+                "predicted_elimination_flag": int(predictions[position]),
+                "elimination_probability": float(probabilities[position]),
+                "model_recommendation": model_recommendation,
+                # The safe default: a client that reads only
+                # "recommendation" must not be shown a decision an
+                # engineer has already overruled.
+                "recommendation": override["sme_decision"] if override else model_recommendation,
+                "confidence": "HIGH"
+                if abs(probabilities[position] - 0.5) > HIGH_CONFIDENCE_MARGIN
+                else "MODERATE",
+                "sme_override": _override_summary(override),
+            }
+        )
+
+    overridden = sum(1 for result in results if result["sme_override"] is not None)
+    logger.info(
+        "Scored %d CMLs from %s (%d overridden by an SME)",
+        len(results),
+        file.filename,
+        overridden,
+    )
     return {
         "rows_scored": len(results),
         "results": results[: settings.MAX_RESULTS_IN_RESPONSE],
         "total_results": len(results),
         "results_truncated": len(results) > settings.MAX_RESULTS_IN_RESPONSE,
+        "sme_overrides_applied": overridden,
         "model_info": {
             "model_type": type(loaded).__name__,
             "features_used": columns,
@@ -358,6 +407,16 @@ async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
         ) from exc
 
     features["recommendation"] = features["predicted_elimination"].map({1: "ELIMINATE", 0: "KEEP"})
+
+    # Fold in expert decisions so the totals describe what will actually
+    # be acted on, not what the model would have said on its own.
+    features = sme_manager.apply_overrides_to_predictions(features)
+    if "final_decision" in features.columns:
+        overruled = features["final_decision"].notna()
+        features.loc[overruled, "predicted_elimination"] = features.loc[
+            overruled, "final_decision"
+        ].map({"ELIMINATE": 1, "KEEP": 0})
+
     features["confidence_level"] = (
         (features["elimination_probability"] - 0.5).abs() > HIGH_CONFIDENCE_MARGIN
     ).map({True: "HIGH", False: "MODERATE"})
