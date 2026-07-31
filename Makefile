@@ -10,7 +10,7 @@ DASHBOARD_PORT ?= 8501
 DATASET        ?= data/cml_sample_500.csv
 
 .DEFAULT_GOAL := help
-.PHONY: help setup api dashboard dev test test-fast lint format check train docker-up docker-down clean
+.PHONY: help setup api dashboard dev test test-fast lint typecheck audit format check train docker-up docker-down clean
 
 help:  ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -48,11 +48,17 @@ lint:  ## Check formatting and lint rules
 	$(VENV)/bin/ruff check .
 	$(VENV)/bin/ruff format --check .
 
+typecheck:  ## Run static type checking
+	$(VENV)/bin/mypy
+
+audit:  ## Check dependencies for known vulnerabilities
+	$(VENV)/bin/pip-audit
+
 format:  ## Apply formatting and safe lint fixes
 	$(VENV)/bin/ruff check --fix .
 	$(VENV)/bin/ruff format .
 
-check: lint test  ## Everything CI runs
+check: lint typecheck audit test  ## Everything CI runs
 
 train:  ## Retrain the model from DATASET (overwrites models/)
 	$(PY) ml/train_enhanced.py $(DATASET)

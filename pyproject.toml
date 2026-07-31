@@ -61,3 +61,22 @@ omit = ["*/__init__.py"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
+
+[tool.mypy]
+python_version = "3.11"
+files = ["app", "ml"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+# The codebase is progressively typed: annotations are required on new and
+# refactored modules, but existing helpers are not blocked on a full pass.
+disallow_untyped_defs = false
+
+# Third-party packages that ship no type information. Listing them
+# explicitly means a *new* untyped import is reported rather than silently
+# absorbed by a blanket ignore_missing_imports = true.
+[[tool.mypy.overrides]]
+module = ["joblib.*", "plotly.*", "sklearn.*"]
+ignore_missing_imports = true

@@ -1,5 +1,7 @@
 """Enhanced CML Elimination Model Training Pipeline."""
 
+from __future__ import annotations
+
 import json
 import sys
 from datetime import datetime
@@ -27,8 +29,8 @@ class EnhancedCMLModelTrainer:
         self.data_path = Path(data_path)
         self.model_output_dir = Path(model_output_dir)
         self.model_output_dir.mkdir(exist_ok=True)
-        self.model = None
-        self.feature_names = None
+        self.model: Pipeline | None = None
+        self.feature_names: list[str] | None = None
 
     def load_data(self) -> pd.DataFrame:
         """Load and validate CML data."""
@@ -149,11 +151,14 @@ class EnhancedCMLModelTrainer:
 
         grid_search.fit(X_train, y_train)
 
-        self.model = grid_search.best_estimator_
+        # Bound to a local as well as the attribute: the attribute is
+        # Optional, and an assert would vanish under `python -O`.
+        model: Pipeline = grid_search.best_estimator_
+        self.model = model
 
         # Evaluate
-        y_pred = self.model.predict(X_test)
-        y_proba = self.model.predict_proba(X_test)[:, 1]
+        y_pred = model.predict(X_test)
+        y_proba = model.predict_proba(X_test)[:, 1]
 
         print("\nClassification Report:")
         print(classification_report(y_test, y_pred, target_names=["Keep", "Eliminate"]))
@@ -162,16 +167,14 @@ class EnhancedCMLModelTrainer:
         print(f"\nBest Parameters: {grid_search.best_params_}")
 
         # Cross-validation scores
-        cv_scores = cross_val_score(self.model, X, y, cv=n_splits, scoring="f1")
+        cv_scores = cross_val_score(model, X, y, cv=n_splits, scoring="f1")
         print(f"\nCross-validation F1 scores: {cv_scores}")
         print(f"Mean CV F1: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
 
         # Feature importance
-        if hasattr(self.model.named_steps["classifier"], "feature_importances_"):
-            importances = self.model.named_steps["classifier"].feature_importances_
-            feature_names_transformed = self.model.named_steps[
-                "preprocessor"
-            ].get_feature_names_out()
+        if hasattr(model.named_steps["classifier"], "feature_importances_"):
+            importances = model.named_steps["classifier"].feature_importances_
+            feature_names_transformed = model.named_steps["preprocessor"].get_feature_names_out()
             feature_importance_df = pd.DataFrame(
                 {"feature": feature_names_transformed, "importance": importances}
             ).sort_values("importance", ascending=False)
@@ -180,7 +183,7 @@ class EnhancedCMLModelTrainer:
             print(feature_importance_df.head(10).to_string(index=False))
 
         return {
-            "test_accuracy": float(self.model.score(X_test, y_test)),
+            "test_accuracy": float(model.score(X_test, y_test)),
             "roc_auc": float(roc_auc_score(y_test, y_proba)),
             "f1_score": float(f1_score(y_test, y_pred)),
             "cv_f1_mean": float(cv_scores.mean()),
