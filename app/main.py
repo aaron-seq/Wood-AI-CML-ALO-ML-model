@@ -14,13 +14,12 @@ from typing import Any
 
 import joblib
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.features import engineer_features
-from app.forecasting import CMLForecaster
+from app.features import engineer_features, resolve_minimum_thickness
 from app.ingestion import UploadError, read_upload
 from app.schemas import (
     ForecastOutput,
@@ -33,6 +32,7 @@ from app.schemas import (
     SMEOverrideResponse,
     UploadResponse,
 )
+from app.security import require_api_key, require_api_key_for_reads
 from app.sme_override import SMEOverrideManager
 from app.utils import (
     calculate_inspection_schedule,
@@ -67,10 +67,6 @@ HIGH_CONFIDENCE_MARGIN = 0.3
 model: Any | None = None
 
 sme_manager = SMEOverrideManager(settings.SME_OVERRIDE_FILE)
-forecaster = CMLForecaster(
-    minimum_thickness=settings.DEFAULT_MINIMUM_THICKNESS,
-    safety_factor=settings.SAFETY_FACTOR,
-)
 
 
 def _load_model() -> Any | None:
@@ -205,10 +201,17 @@ async def health() -> dict[str, Any]:
         "model_loaded": model is not None,
         "model_path": str(settings.MODEL_PATH) if settings.MODEL_PATH.exists() else None,
         "version": settings.API_VERSION,
+        # Reports whether a key is required, never the key itself.
+        "auth": settings.API_KEY_SCOPE if settings.API_KEY else "disabled",
     }
 
 
-@app.get("/model/info", response_model=ModelInfoResponse, tags=["meta"])
+@app.get(
+    "/model/info",
+    response_model=ModelInfoResponse,
+    tags=["meta"],
+    dependencies=[Depends(require_api_key_for_reads)],
+)
 async def model_info() -> dict[str, Any]:
     """Describe the loaded estimator and the features it consumes."""
     loaded = _require_model()
@@ -219,7 +222,12 @@ async def model_info() -> dict[str, Any]:
     }
 
 
-@app.post("/upload-cml-data", response_model=UploadResponse, tags=["data"])
+@app.post(
+    "/upload-cml-data",
+    response_model=UploadResponse,
+    tags=["data"],
+    dependencies=[Depends(require_api_key_for_reads)],
+)
 async def upload_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
     """Parse and validate a CML file without scoring it.
 
@@ -239,13 +247,28 @@ async def upload_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
     }
 
 
-@app.post("/score-cml-data", response_model=ScoreResponse, tags=["scoring"])
-async def score_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
+@app.post(
+    "/score-cml-data",
+    response_model=ScoreResponse,
+    tags=["scoring"],
+    dependencies=[Depends(require_api_key_for_reads)],
+)
+async def score_cml_data(
+    file: UploadFile = File(...),
+    offset: int = Query(0, ge=0, description="Index of the first result to return, for paging"),
+    limit: int | None = Query(
+        None,
+        ge=1,
+        description="Maximum results to return. Defaults to MAX_RESULTS_IN_RESPONSE.",
+    ),
+) -> dict[str, Any]:
     """Score every CML in the uploaded file for elimination.
 
-    Rows are scored as one batch. The response echoes at most
-    ``MAX_RESULTS_IN_RESPONSE`` results; ``total_results`` always reports
-    the true count.
+    Every row is always scored; ``offset`` and ``limit`` page over the
+    results in the response body. Without them the response is capped at
+    ``MAX_RESULTS_IN_RESPONSE`` as before, so existing clients are
+    unaffected -- but a large batch is now fully retrievable rather than
+    silently truncated at 100.
     """
     loaded = _require_model()
     df = await read_upload(file, settings.MAX_UPLOAD_BYTES, settings.MAX_UPLOAD_ROWS)
@@ -310,11 +333,19 @@ async def score_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
         file.filename,
         overridden,
     )
+
+    page_size = limit if limit is not None else settings.MAX_RESULTS_IN_RESPONSE
+    page = results[offset : offset + page_size]
+
     return {
         "rows_scored": len(results),
-        "results": results[: settings.MAX_RESULTS_IN_RESPONSE],
+        "results": page,
         "total_results": len(results),
-        "results_truncated": len(results) > settings.MAX_RESULTS_IN_RESPONSE,
+        # True whenever the body holds fewer results than were scored,
+        # whether that is the default cap or an explicit page.
+        "results_truncated": len(page) < len(results),
+        "offset": offset,
+        "limit": page_size,
         "sme_overrides_applied": overridden,
         "model_info": {
             "model_type": type(loaded).__name__,
@@ -328,6 +359,7 @@ async def score_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
     "/forecast-remaining-life",
     response_model=list[ForecastOutput],
     tags=["forecasting"],
+    dependencies=[Depends(require_api_key_for_reads)],
 )
 async def forecast_remaining_life(file: UploadFile = File(...)) -> list[ForecastOutput]:
     """Project remaining life and a next-inspection date for each CML."""
@@ -339,14 +371,18 @@ async def forecast_remaining_life(file: UploadFile = File(...)) -> list[Forecast
 
     logger.info("Forecasting %d CMLs from %s", len(df), file.filename)
 
+    # Honour a per-row minimum allowable thickness where the file gives
+    # one; fall back to the configured default otherwise.
+    minimum_thickness = resolve_minimum_thickness(df, settings.DEFAULT_MINIMUM_THICKNESS)
+
     results: list[ForecastOutput] = []
     skipped = 0
-    for _, row in df.iterrows():
+    for position, (_, row) in enumerate(df.iterrows()):
         try:
             schedule = calculate_inspection_schedule(
                 corrosion_rate=float(row["average_corrosion_rate"]),
                 thickness=float(row["thickness_mm"]),
-                min_thickness=settings.DEFAULT_MINIMUM_THICKNESS,
+                min_thickness=float(minimum_thickness.iloc[position]),
                 safety_factor=settings.SAFETY_FACTOR,
             )
         except (ValueError, TypeError) as exc:
@@ -375,7 +411,12 @@ async def forecast_remaining_life(file: UploadFile = File(...)) -> list[Forecast
     return results
 
 
-@app.post("/generate-report", response_model=ReportResponse, tags=["reporting"])
+@app.post(
+    "/generate-report",
+    response_model=ReportResponse,
+    tags=["reporting"],
+    dependencies=[Depends(require_api_key_for_reads)],
+)
 async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
     """Score a file and summarise the results as an elimination report.
 
@@ -426,7 +467,12 @@ async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
     return report
 
 
-@app.get("/sme-override", response_model=SMEOverrideListResponse, tags=["sme"])
+@app.get(
+    "/sme-override",
+    response_model=SMEOverrideListResponse,
+    tags=["sme"],
+    dependencies=[Depends(require_api_key_for_reads)],
+)
 async def list_sme_overrides() -> dict[str, Any]:
     """List every recorded expert override plus agreement statistics."""
     return {
@@ -440,6 +486,7 @@ async def list_sme_overrides() -> dict[str, Any]:
     response_model=SMEOverrideResponse,
     status_code=status.HTTP_201_CREATED,
     tags=["sme"],
+    dependencies=[Depends(require_api_key)],
 )
 async def create_sme_override(override: SMEOverride) -> dict[str, Any]:
     """Record an expert decision that supersedes the model's recommendation.
@@ -466,7 +513,11 @@ async def create_sme_override(override: SMEOverride) -> dict[str, Any]:
     return {"override": stored, "message": f"Override recorded for {override.id_number}"}
 
 
-@app.delete("/sme-override/{id_number}", tags=["sme"])
+@app.delete(
+    "/sme-override/{id_number}",
+    tags=["sme"],
+    dependencies=[Depends(require_api_key)],
+)
 async def delete_sme_override(id_number: str) -> dict[str, str]:
     """Withdraw a previously recorded override."""
     if not sme_manager.remove_override(id_number):

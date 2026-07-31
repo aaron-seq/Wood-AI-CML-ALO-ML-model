@@ -76,6 +76,10 @@ class HealthResponse(BaseModel):
     model_loaded: bool = Field(..., description="Whether ML model is loaded")
     model_path: str | None = Field(None, description="Path to model file")
     version: str = Field(..., description="API version")
+    auth: str = Field(
+        "disabled",
+        description="Which endpoints require X-API-Key: 'disabled', 'writes' or 'all'",
+    )
 
 
 class UploadResponse(BaseModel):
@@ -187,6 +191,8 @@ class ScoreResponse(BaseModel):
     results_truncated: bool = Field(
         False, description="True when 'results' holds fewer entries than 'total_results'"
     )
+    offset: int = Field(0, ge=0, description="Index of the first result in this page")
+    limit: int = Field(0, ge=0, description="Maximum results this page could hold")
     sme_overrides_applied: int = Field(
         0, ge=0, description="How many scored CMLs carried an expert override"
     )

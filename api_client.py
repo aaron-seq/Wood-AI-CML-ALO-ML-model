@@ -18,6 +18,7 @@ from typing import Any
 import requests
 
 DEFAULT_API_URL = "http://localhost:8000"
+API_KEY_HEADER = "X-API-Key"
 HEALTH_TIMEOUT_SECONDS = 5
 SCORE_TIMEOUT_SECONDS = 120
 
@@ -31,10 +32,25 @@ def get_api_base_url() -> str:
     return os.environ.get("CML_API_URL", DEFAULT_API_URL).rstrip("/")
 
 
+def auth_headers() -> dict[str, str]:
+    """Headers carrying the API key, or an empty dict when none is set.
+
+    Public because the dashboard makes its own calls for model metadata
+    and needs the same credentials.
+
+    The API only requires it when its own API_KEY is set, so an
+    unconfigured dashboard against an unconfigured API is unchanged.
+    """
+    api_key = os.environ.get("CML_API_KEY")
+    return {API_KEY_HEADER: api_key} if api_key else {}
+
+
 def check_api_health(timeout: int = HEALTH_TIMEOUT_SECONDS) -> bool:
     """Return True when the API answers its health probe."""
     try:
-        response = requests.get(f"{get_api_base_url()}/health", timeout=timeout)
+        response = requests.get(
+            f"{get_api_base_url()}/health", timeout=timeout, headers=auth_headers()
+        )
     except requests.RequestException:
         return False
     return response.status_code == 200
@@ -71,6 +87,12 @@ def score_cml_data(uploaded_file, timeout: int = SCORE_TIMEOUT_SECONDS) -> dict[
         raise APIError(f"The API did not respond within {timeout}s.") from exc
     except requests.RequestException as exc:
         raise APIError(f"Request to {base_url} failed: {exc}") from exc
+
+    if response.status_code == 401:
+        raise APIError(
+            "The API rejected the request: it requires an API key. "
+            "Set CML_API_KEY for the dashboard to match the API's API_KEY."
+        )
 
     if not response.ok:
         raise APIError(f"API returned {response.status_code}: {_error_detail(response)}")

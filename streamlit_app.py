@@ -21,7 +21,13 @@ logger = logging.getLogger(__name__)
 
 # Use proper imports
 try:
-    from api_client import APIError, check_api_health, get_api_base_url, score_cml_data
+    from api_client import (
+        APIError,
+        auth_headers,
+        check_api_health,
+        get_api_base_url,
+        score_cml_data,
+    )
     from app.config import settings
     from app.forecasting import CMLForecaster
     from app.ingestion import UploadError, parse_bytes
@@ -35,8 +41,6 @@ except ImportError as e:
 # Constants
 DEFAULT_MINIMUM_THICKNESS = 3.0
 DEFAULT_SAFETY_FACTOR = 1.5
-MAX_PREVIEW_ROWS = 10
-MAX_RESULTS_DISPLAY = 100
 LOGO_PATH = Path("Wood-logo-WHITE-45mm.png")
 
 # Page configuration
@@ -120,7 +124,9 @@ def get_model_description(api_online: bool) -> str:
     if not api_online:
         return "Unknown"
     try:
-        response = requests.get(f"{get_api_base_url()}/model/info", timeout=5)
+        response = requests.get(
+            f"{get_api_base_url()}/model/info", timeout=5, headers=auth_headers()
+        )
     except requests.RequestException:
         return "Unknown"
     if response.status_code == 503:
