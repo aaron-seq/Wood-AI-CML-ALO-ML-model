@@ -11,7 +11,7 @@ override system exists because an engineer, not the model, owns the call.
 
 [![CI](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
-![Coverage](https://img.shields.io/badge/coverage-88%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -23,7 +23,7 @@ git clone https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model.git
 cd Wood-AI-CML-ALO-ML-model
 
 make setup   # create .venv and install everything
-make test    # 169 tests, should pass in ~15s
+make test    # 233 tests, should pass in ~35s
 make dev     # API on :8000, dashboard on :8501
 ```
 
@@ -63,6 +63,7 @@ them:
 | Column | Effect if omitted |
 | --- | --- |
 | `risk_score` | Derived from corrosion rate and thickness |
+| `minimum_thickness_mm` | Falls back to the global 3.0 mm floor |
 | `remaining_life_years` | Derived via the API 570 formula |
 | `last_inspection_date` | Inspection age defaults to 365 days |
 
@@ -80,6 +81,7 @@ Full reference with request and response bodies:
 | --- | --- | --- |
 | `GET` | `/health` | Liveness and model-loaded status |
 | `GET` | `/model/info` | Loaded estimator and its feature columns |
+| `GET` | `/metrics` | Prometheus metrics (404 unless enabled) |
 | `POST` | `/upload-cml-data` | Parse and validate a file without scoring it |
 | `POST` | `/score-cml-data` | Score every CML, applying any expert overrides |
 | `POST` | `/forecast-remaining-life` | Remaining life and next inspection date |
@@ -100,6 +102,19 @@ is partial.
 Recorded expert decisions supersede the model: `recommendation` is the
 decision to act on, `model_recommendation` is what the model said on its
 own, and `sme_override` names who overruled it and why.
+
+Pass `?offset=&limit=` to page through a large batch — the default is the
+first 100, as before.
+
+### Authentication
+
+Off by default. Set `API_KEY` (16+ characters) and callers must send
+`X-API-Key`. `API_KEY_SCOPE=writes` (the default) gates only the endpoints
+that mutate the SME audit trail; `all` gates scoring and reporting too. `/`
+and `/health` are never gated, so orchestrator probes keep working.
+
+This is a shared secret, not an identity: `sme_name` on an override is still
+self-declared. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
@@ -177,6 +192,8 @@ app/                      FastAPI application
   config.py               Settings (env / .env driven)
   features.py             Shared feature engineering (API + training)
   risk.py                 Risk classification and inspection intervals
+  security.py             Optional API-key gate
+  observability.py        JSON logging and Prometheus metrics
   ingestion.py            Upload validation and parsing
   forecasting.py          Remaining-life and inspection scheduling
   sme_override.py         Expert override store
@@ -186,7 +203,7 @@ app/                      FastAPI application
 ml/train_enhanced.py      Training pipeline with grid search
 streamlit_app.py          Dashboard
 api_client.py             Dashboard's HTTP client
-tests/                    169 tests
+tests/                    233 tests
 docs/                     Architecture, API, deployment, model card, ADRs
 ```
 
@@ -226,16 +243,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
 
 - **Both datasets are synthetic.** Reported metrics do not predict field
   performance.
-- **No authentication.** Any client that can reach the port can score data and
-  write SME overrides. Deploy behind an authenticating gateway.
+- **Authentication is a shared secret at best.** The optional API key gates
+  access but does not identify the caller, so overrides remain attributable
+  only to a self-declared name. Deploy behind an authenticating gateway.
 - **Overrides are stored in a JSON file**, written atomically and guarded by
   an advisory lock. That makes a single host safe; it does not coordinate
   across hosts, so run one replica until the store moves to a database.
 - **Uploads are parsed entirely in memory.** The size limit is the memory
   bound; size container limits accordingly.
 - **`elimination_probability` is a Random Forest vote share**, not a calibrated
-  probability. The HIGH/MODERATE label reflects distance from the decision
-  boundary, not a validated confidence interval.
+  probability. Calibration is implemented (`make train CALIBRATE=sigmoid`) but
+  off by default because it was measured and did not help — see the model card.
 - **Single process, no queue.** A large file is scored synchronously inside the
   request.
 

@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     MAX_RESULTS_IN_RESPONSE: int = 100
 
     LOG_LEVEL: str = "INFO"
+    # "json" emits one structured object per line for log aggregators;
+    # "text" stays human-readable, which is the better local default.
+    LOG_FORMAT: Literal["text", "json"] = "text"
+    # /metrics is off unless enabled: it reveals traffic volume and should
+    # not be reachable from the internet by default.
+    METRICS_ENABLED: bool = False
 
     # Optional shared-secret gate. Unset means no authentication, which
     # is the historical behaviour and stays the default so upgrading does

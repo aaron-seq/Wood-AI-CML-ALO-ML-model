@@ -63,8 +63,13 @@ the full list. What actually needs attention in production:
 
 Before exposing this to users:
 
-- [ ] **Put an authenticating gateway in front.** There is no authentication.
-      Anything that can reach the port can score data and write SME overrides.
+- [ ] **Set `API_KEY`** (16+ characters, e.g.
+      `python -c "import secrets; print(secrets.token_urlsafe(32))"`). It is
+      unset by default, which leaves every endpoint open. Consider
+      `API_KEY_SCOPE=all` if nothing internal needs unauthenticated scoring.
+- [ ] **Still put an authenticating gateway in front.** The API key is a
+      shared secret, not an identity: it cannot tell you *which* engineer
+      recorded an override, and `sme_name` remains self-declared.
 - [ ] **Terminate TLS** at the gateway or load balancer.
 - [ ] **Set `CORS_ORIGINS`** to your dashboard's real origin.
 - [ ] **Rate-limit** at the gateway. Scoring is synchronous and CPU-bound; an
@@ -78,8 +83,13 @@ Before exposing this to users:
       over a network filesystem.
 - [ ] **Wire `/health` to your orchestrator's liveness and readiness probes.**
       Treat `status: degraded` as not-ready.
-- [ ] **Ship logs somewhere queryable.** Correlate client reports by the
+- [ ] **Set `LOG_FORMAT=json`** so logs carry request id, path, status and
+      duration as fields rather than prose. Correlate client reports by the
       `x-request-id` header, which appears on every response.
+- [ ] **Enable `METRICS_ENABLED`** and scrape `/metrics` from inside the
+      network. Watch `cml_sme_overrides_applied_total` against
+      `cml_scored_total`: a rising ratio means experts are increasingly
+      overruling the model.
 - [ ] **Validate the model against real inspection outcomes.** Both bundled
       datasets are synthetic — see [MODEL_CARD.md](MODEL_CARD.md).
 
@@ -161,12 +171,13 @@ Ordered by what most limits production readiness:
    identity rather than a free-text `sme_name`.
 3. **Move overrides to a database** with row-level locking; removes the
    single-host constraint that the advisory lock leaves in place.
-4. **Calibrate probabilities** (`CalibratedClassifierCV`) so
-   `elimination_probability` can be read as a probability and the confidence
-   label means something checkable.
+4. **Revisit calibration once the model is worth calibrating.**
+   `CalibratedClassifierCV` is already wired in behind
+   `make train CALIBRATE=sigmoid`, but on the current data it costs more F1
+   than it recovers in calibration error (see MODEL_CARD.md).
 5. **Stream or queue large uploads** instead of parsing them in-request.
-6. **Metrics and tracing** — Prometheus counters and OpenTelemetry spans.
-   Request ids are already threaded through, which is the prerequisite.
+6. **Distributed tracing** — OpenTelemetry spans. Prometheus counters and
+   request ids are in place; spans across the dashboard/API boundary are not.
 7. **Per-circuit minimum thickness.** `app/risk.py` uses one global 3.0 mm
    floor; real programmes derive it per circuit from design pressure and
    material, which would also let the risk thresholds be calibrated rather

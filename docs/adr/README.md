@@ -17,3 +17,4 @@ decision came out of a specific GitHub issue, that issue is linked.
 | [0004](0004-centralise-upload-validation.md) | Centralise upload validation; client errors are 400s | Accepted |
 | [0005](0005-single-risk-classifier.md) | One risk classifier, and it is the conservative one | Accepted |
 | [0006](0006-overrides-supersede-the-model.md) | Expert overrides supersede the model in the response | Accepted |
+| [0007](0007-calibration-measured-and-declined.md) | Calibration is implemented, measured and left off | Accepted |

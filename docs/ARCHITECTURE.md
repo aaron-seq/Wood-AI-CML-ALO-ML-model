@@ -73,6 +73,8 @@ condition that previously caused train/serve skew (see
 | `app/ingestion.py` | Upload size/format/parse; `UploadError` | pandas |
 | `app/features.py` | Engineered feature columns | pandas, numpy |
 | `app/risk.py` | Risk level and inspection interval, shared by all surfaces | pandas, numpy |
+| `app/security.py` | Optional API-key gate; no-op when unconfigured | fastapi |
+| `app/observability.py` | JSON log formatter and Prometheus counters | — |
 | `app/utils.py` | Dataframe validation, inspection schedule, reports | pandas |
 | `app/forecasting.py` | `CMLForecaster`: life, intervals, risk levels | `app.features`, `app.risk` |
 | `app/sme_override.py` | Override persistence (atomic + locked) and statistics | pandas |
@@ -224,6 +226,7 @@ Recorded as ADRs in [`adr/`](adr/):
 | [0004](adr/0004-centralise-upload-validation.md) | Centralise upload validation; client errors are 400s |
 | [0005](adr/0005-single-risk-classifier.md) | One risk classifier, and it is the conservative one |
 | [0006](adr/0006-overrides-supersede-the-model.md) | Expert overrides supersede the model in the response |
+| [0007](adr/0007-calibration-measured-and-declined.md) | Calibration is implemented, measured and left off |
 
 ## Conventions
 

@@ -8,6 +8,7 @@ PIP     := $(VENV)/bin/pip
 API_PORT       ?= 8000
 DASHBOARD_PORT ?= 8501
 DATASET        ?= data/cml_sample_500.csv
+CALIBRATE      ?=
 
 .DEFAULT_GOAL := help
 .PHONY: help setup api dashboard dev test test-fast lint typecheck audit format check train docker-up docker-down clean
@@ -60,8 +61,8 @@ format:  ## Apply formatting and safe lint fixes
 
 check: lint typecheck audit test  ## Everything CI runs
 
-train:  ## Retrain the model from DATASET (overwrites models/)
-	$(PY) ml/train_enhanced.py $(DATASET)
+train:  ## Retrain the model from DATASET (overwrites models/). CALIBRATE=sigmoid|isotonic
+	$(PY) ml/train_enhanced.py $(DATASET) $(if $(CALIBRATE),--calibrate $(CALIBRATE),)
 
 docker-up:  ## Build and start the full stack
 	docker compose up --build

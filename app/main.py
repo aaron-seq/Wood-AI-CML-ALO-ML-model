@@ -8,6 +8,7 @@ This is the single canonical API entry point. Start it with:
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -16,11 +17,12 @@ import joblib
 import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.config import settings
 from app.features import engineer_features, resolve_minimum_thickness
 from app.ingestion import UploadError, read_upload
+from app.observability import configure_logging, metrics
 from app.schemas import (
     ForecastOutput,
     HealthResponse,
@@ -40,10 +42,7 @@ from app.utils import (
     validate_cml_dataframe,
 )
 
-logging.basicConfig(
-    level=settings.LOG_LEVEL,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # Fallback for a model whose pickle predates ``feature_names_in_``. The
@@ -119,12 +118,36 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    """Tag each request so a log line can be traced back to a client report."""
+async def observe_request(request: Request, call_next):
+    """Tag each request with an id and record its outcome and duration."""
     request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
     request.state.request_id = request_id
+
+    started = time.perf_counter()
     response = await call_next(request)
+    elapsed = time.perf_counter() - started
+
     response.headers["x-request-id"] = request_id
+    # The route template, not request.url.path, so /sme-override/CML-001
+    # does not mint a new metric series per CML id.
+    route = request.scope.get("route")
+    path = getattr(route, "path", request.url.path)
+    metrics.observe_request(request.method, path, response.status_code, elapsed)
+
+    logger.info(
+        "%s %s -> %s in %.1fms",
+        request.method,
+        path,
+        response.status_code,
+        elapsed * 1000,
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "path": path,
+            "status_code": response.status_code,
+            "duration_ms": round(elapsed * 1000, 2),
+        },
+    )
     return response
 
 
@@ -204,6 +227,19 @@ async def health() -> dict[str, Any]:
         # Reports whether a key is required, never the key itself.
         "auth": settings.API_KEY_SCOPE if settings.API_KEY else "disabled",
     }
+
+
+@app.get("/metrics", response_class=PlainTextResponse, tags=["meta"])
+async def prometheus_metrics() -> PlainTextResponse:
+    """Prometheus text-format metrics for this process.
+
+    Returns 404 unless ``METRICS_ENABLED``, so an unconfigured deployment
+    does not expose its traffic volume. Scrape it from inside the network,
+    not through a public ingress.
+    """
+    if not settings.METRICS_ENABLED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Metrics are not enabled.")
+    return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
 
 
 @app.get(
@@ -333,6 +369,8 @@ async def score_cml_data(
         file.filename,
         overridden,
     )
+
+    metrics.observe_scoring(len(results), overridden)
 
     page_size = limit if limit is not None else settings.MAX_RESULTS_IN_RESPONSE
     page = results[offset : offset + page_size]

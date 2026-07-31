@@ -71,7 +71,8 @@ Say so explicitly in the PR, and include a rollback plan:
 | Model artifact or feature set | Changes predictions. Include before/after metrics and retrain against `data/cml_sample_500.csv` |
 | `scikit-learn` pin | Requires retraining — the artifact is a pickle. Follow [DEPLOYMENT.md](docs/DEPLOYMENT.md#upgrading-scikit-learn) and commit requirements, artifact and metadata together |
 | Upload limits | These bound worker memory |
-| CORS or anything auth-adjacent | Security surface |
+| CORS, `app/security.py` or anything auth-adjacent | Security surface. Auth must stay disabled by default |
+| Calibration or the probability contract | See [ADR-0007](docs/adr/0007-calibration-measured-and-declined.md) before re-enabling |
 | SME override storage format | Existing audit trails must stay readable, and writes must stay atomic |
 | Risk thresholds in `app/risk.py` | Changes what gets inspected and when |
 | CI or Dockerfile | Affects everything downstream |
