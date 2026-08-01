@@ -7,7 +7,11 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from app import risk
-from app.features import MAX_REMAINING_LIFE_YEARS, MINIMUM_THICKNESS_COLUMN
+from app.features import (
+    MAX_REMAINING_LIFE_YEARS,
+    MIN_MEASURABLE_CORROSION_RATE,
+    MINIMUM_THICKNESS_COLUMN,
+)
 
 
 class CMLForecaster:
@@ -40,7 +44,9 @@ class CMLForecaster:
         if available_thickness <= 0:
             return 0.0
 
-        if corrosion_rate <= 0:
+        # Same epsilon as app.features: a rate below it is not measurable
+        # corrosion, and dividing by it overflows.
+        if corrosion_rate < MIN_MEASURABLE_CORROSION_RATE:
             return MAX_REMAINING_LIFE_YEARS
 
         remaining_life = available_thickness / corrosion_rate
