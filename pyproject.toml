@@ -61,6 +61,9 @@ omit = ["*/__init__.py"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
+# A floor, not a target. Set just below the current figure so a genuine
+# drop fails the build while ordinary refactoring does not thrash it.
+fail_under = 90
 
 [tool.mypy]
 python_version = "3.11"

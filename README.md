@@ -216,7 +216,13 @@ make check      # exactly what CI runs: lint, types, audit, tests
 make format     # apply formatting and safe fixes
 make typecheck  # mypy over app/ and ml/
 make audit      # fail on any known CVE in a shipped dependency
+make bench      # scoring throughput and memory by stage
 ```
+
+Coverage is enforced at a 90% floor. Property-based tests (Hypothesis)
+cover the engineering calculations; they found three overflow bugs the
+example-based tests missed. `pre-commit install` is optional and runs the
+fast checks locally.
 
 `make check` runs ruff (lint + format), mypy, pip-audit and the tests.
 Configuration for all of them is in `pyproject.toml`.
@@ -255,7 +261,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
   probability. Calibration is implemented (`make train CALIBRATE=sigmoid`) but
   off by default because it was measured and did not help — see the model card.
 - **Single process, no queue.** A large file is scored synchronously inside the
-  request.
+  request. Measured at 553 ms for 50,000 CMLs, so this is a concurrency limit
+  rather than a latency one — see [measured throughput](docs/DEPLOYMENT.md#measured-throughput).
 
 Planned work is tracked in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#future-work).
 

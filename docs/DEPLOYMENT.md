@@ -59,6 +59,34 @@ the full list. What actually needs attention in production:
 | `MODEL_DIR` | Point at a mounted volume to swap models without rebuilding |
 | `CML_API_URL` | Where the dashboard looks for the API |
 
+## Measured throughput
+
+From `make bench` on one core (medians of three runs, synthetic data
+shaped like the real dataset):
+
+| CMLs | parse | validate | features | inference | end-to-end | peak memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| 500 | 2 ms | 3 ms | 4 ms | 25 ms | 35 ms | 0.2 MiB |
+| 10,000 | 13 ms | 8 ms | 6 ms | 99 ms | 130 ms | 4 MiB |
+| 100,000 | 136 ms | 109 ms | 32 ms | 799 ms | 1.1 s | 41 MiB |
+
+A full 50,000-row scoring request measured **553 ms end to end** through
+the API, including multipart handling and JSON serialisation.
+
+Two things follow:
+
+- **Inference dominates** — roughly three quarters of the time at every
+  size. Parsing and feature engineering are not worth optimising; model
+  size is the lever, and CPU is what to scale on.
+- **The row limit binds before the byte limit.** 100,000 rows is about
+  5.5 MB of CSV, well under the 25 MB default. Peak memory at that size is
+  ~41 MiB per in-flight request, so `MAX_UPLOAD_BYTES` × workers
+  overstates the real footprint by a wide margin. Size on measured peak
+  plus headroom, not on the byte limit.
+
+Re-run after any change to the model or the feature pipeline; the script
+takes about a minute.
+
 ## Production checklist
 
 Before exposing this to users:
@@ -74,8 +102,9 @@ Before exposing this to users:
 - [ ] **Set `CORS_ORIGINS`** to your dashboard's real origin.
 - [ ] **Rate-limit** at the gateway. Scoring is synchronous and CPU-bound; an
       unthrottled client can saturate the worker.
-- [ ] **Size memory** against `MAX_UPLOAD_BYTES` × workers, with headroom for
-      the parsed DataFrame (several times the file size).
+- [ ] **Size memory** from the measured peak above (~41 MiB per in-flight
+      100,000-row request) × workers, plus headroom. `MAX_UPLOAD_BYTES` is a
+      ceiling on input, not a prediction of memory use.
 - [ ] **Persist `data/`** on a real volume. Losing it loses the SME audit trail.
 - [ ] **Run one replica, or move overrides to a database first.** Writes are
       atomic and guarded by an advisory lock, which makes concurrent writers

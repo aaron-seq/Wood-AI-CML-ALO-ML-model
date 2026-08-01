@@ -19,7 +19,13 @@ invocations so local runs and CI cannot diverge.
 4. `make check` must be green before you push.
 5. Open a PR describing what changed and why.
 
-Coverage must not go down. It currently sits at 87% of `app/` and `ml/`.
+Coverage must not go down; the build fails below 90%. It currently sits at
+93% of `app/` and `ml/`.
+
+Numeric code should carry a property test as well as examples. The
+invariants in `tests/test_properties.py` found three overflow bugs that
+example-based tests had missed — state what must be true for *every*
+input, not just the inputs you thought of.
 
 ## Standards
 

@@ -78,6 +78,8 @@ jobs:
           print("loaded", type(model).__name__, "features:", len(model.feature_names_in_))
           PY
 
+      # --cov enforces the 90% floor configured in pyproject.toml, so a
+      # change that drops coverage fails here rather than in review.
       - name: Run tests
         run: pytest --cov --cov-report=term-missing --cov-report=xml
 

@@ -11,7 +11,7 @@ DATASET        ?= data/cml_sample_500.csv
 CALIBRATE      ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help setup api dashboard dev test test-fast lint typecheck audit format check train docker-up docker-down clean
+.PHONY: help setup api dashboard dev test test-fast lint typecheck audit format check bench train docker-up docker-down clean
 
 help:  ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -60,6 +60,9 @@ format:  ## Apply formatting and safe lint fixes
 	$(VENV)/bin/ruff format .
 
 check: lint typecheck audit test  ## Everything CI runs
+
+bench:  ## Measure scoring throughput and memory by stage
+	$(PY) scripts/benchmark.py
 
 train:  ## Retrain the model from DATASET (overwrites models/). CALIBRATE=sigmoid|isotonic
 	$(PY) ml/train_enhanced.py $(DATASET) $(if $(CALIBRATE),--calibrate $(CALIBRATE),)

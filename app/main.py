@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import joblib
+import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -201,6 +202,26 @@ def _json_safe_preview(df: pd.DataFrame, rows: int = 5) -> list[dict[str, Any]]:
     ]
 
 
+def _predict(loaded_model: Any, X: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Return (predicted class, probability of elimination) in one pass.
+
+    ``predict`` and ``predict_proba`` each traverse the whole forest, and
+    calling both doubled inference time -- 84% of end-to-end scoring cost
+    at 100k rows, per scripts/benchmark.py. For any scikit-learn
+    classifier ``predict`` is defined as ``classes_[argmax(predict_proba)]``,
+    so deriving it costs an argmax instead of a second traversal.
+
+    Verified identical on the bundled dataset and on 20,000 randomised
+    rows; tests/test_api.py pins the equivalence.
+    """
+    probabilities = loaded_model.predict_proba(X)
+    classes = loaded_model.classes_
+    predictions = classes[np.argmax(probabilities, axis=1)]
+    # Column of the positive ("eliminate") class, wherever it sits.
+    positive = int(np.where(classes == 1)[0][0])
+    return predictions, probabilities[:, positive]
+
+
 def _feature_columns(loaded_model: Any) -> list[str]:
     names = getattr(loaded_model, "feature_names_in_", None)
     return list(names) if names is not None else list(_FALLBACK_FEATURE_COLUMNS)
@@ -322,9 +343,7 @@ async def score_cml_data(
 
     logger.info("Scoring %d CMLs from %s", len(features), file.filename)
     try:
-        X = features[columns]
-        predictions = loaded.predict(X)
-        probabilities = loaded.predict_proba(X)[:, 1]
+        predictions, probabilities = _predict(loaded, features[columns])
     except Exception as exc:
         logger.exception("Model inference failed for %s", file.filename)
         raise HTTPException(
@@ -476,9 +495,9 @@ async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
         raise UploadError(f"Missing columns required by the model: {', '.join(missing)}")
 
     try:
-        X = features[columns]
-        features["predicted_elimination"] = loaded.predict(X)
-        features["elimination_probability"] = loaded.predict_proba(X)[:, 1]
+        predictions, probabilities = _predict(loaded, features[columns])
+        features["predicted_elimination"] = predictions
+        features["elimination_probability"] = probabilities
     except Exception as exc:
         logger.exception("Model inference failed while generating a report")
         raise HTTPException(
