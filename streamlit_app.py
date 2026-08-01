@@ -30,7 +30,7 @@ try:
     )
     from app.config import settings
     from app.forecasting import CMLForecaster
-    from app.ingestion import UploadError, parse_bytes
+    from app.ingestion import UploadError, parse_within_limits
     from app.sme_override import SMEOverrideManager
     from app.utils import validate_cml_dataframe
 except ImportError as e:
@@ -90,7 +90,11 @@ else:
 st.sidebar.header("CML Analysis Platform")
 page = st.sidebar.radio(
     "Navigation",
-    [
+    # An explicit key: without one Streamlit derives the widget id from
+    # the label and options, which collides when the script is executed
+    # more than once in a process -- as streamlit.testing.AppTest does.
+    key="navigation",
+    options=[
         "Overview",
         "Upload & Analyze",
         "Forecasting",
@@ -144,29 +148,16 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame | None:
     files the API would reject -- no size limit, no row limit, and
     different error messages for the same bad file.
     """
-    payload = uploaded_file.getvalue()
-
-    if len(payload) > settings.MAX_UPLOAD_BYTES:
-        st.error(
-            f"File is too large ({len(payload) / 1_048_576:.1f} MB). "
-            f"The limit is {settings.MAX_UPLOAD_BYTES / 1_048_576:.0f} MB."
-        )
-        return None
-
     try:
-        frame = parse_bytes(payload, uploaded_file.name)
+        return parse_within_limits(
+            uploaded_file.getvalue(),
+            uploaded_file.name,
+            settings.MAX_UPLOAD_BYTES,
+            settings.MAX_UPLOAD_ROWS,
+        )
     except UploadError as exc:
         st.error(str(exc))
         return None
-
-    if len(frame) > settings.MAX_UPLOAD_ROWS:
-        st.error(
-            f"File contains {len(frame):,} rows, which exceeds the "
-            f"{settings.MAX_UPLOAD_ROWS:,} row limit."
-        )
-        return None
-
-    return frame
 
 
 try:

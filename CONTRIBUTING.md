@@ -22,6 +22,16 @@ invocations so local runs and CI cannot diverge.
 Coverage must not go down; the build fails below 90%. It currently sits at
 93% of `app/` and `ml/`.
 
+Test order is randomised on every run (`pytest-randomly`); the seed is
+printed, and `-p no:randomly` disables it. A test that only passes in one
+order is a test with a hidden dependency.
+
+The Streamlit dashboard is tested with `streamlit.testing.v1.AppTest`
+(`tests/test_dashboard.py`), which runs the script in-process. Coverage
+cannot attribute those lines because AppTest executes rather than imports
+the script, so `streamlit_app.py` is absent from the coverage source --
+tested, but not counted.
+
 Numeric code should carry a property test as well as examples. The
 invariants in `tests/test_properties.py` found three overflow bugs that
 example-based tests had missed — state what must be true for *every*

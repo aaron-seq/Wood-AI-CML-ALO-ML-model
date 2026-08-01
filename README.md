@@ -23,7 +23,7 @@ git clone https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model.git
 cd Wood-AI-CML-ALO-ML-model
 
 make setup   # create .venv and install everything
-make test    # 233 tests, should pass in ~35s
+make test    # 283 tests, should pass in ~45s
 make dev     # API on :8000, dashboard on :8501
 ```
 
@@ -203,7 +203,7 @@ app/                      FastAPI application
 ml/train_enhanced.py      Training pipeline with grid search
 streamlit_app.py          Dashboard
 api_client.py             Dashboard's HTTP client
-tests/                    233 tests
+tests/                    283 tests
 docs/                     Architecture, API, deployment, model card, ADRs
 ```
 
@@ -219,10 +219,11 @@ make audit      # fail on any known CVE in a shipped dependency
 make bench      # scoring throughput and memory by stage
 ```
 
-Coverage is enforced at a 90% floor. Property-based tests (Hypothesis)
-cover the engineering calculations; they found three overflow bugs the
-example-based tests missed. `pre-commit install` is optional and runs the
-fast checks locally.
+Coverage is enforced at a 90% floor and test order is randomised each run.
+Property-based tests (Hypothesis) cover the engineering calculations —
+they found three overflow bugs the example-based tests missed — and the
+dashboard is tested through `streamlit.testing.AppTest`.
+`pre-commit install` is optional and runs the fast checks locally.
 
 `make check` runs ruff (lint + format), mypy, pip-audit and the tests.
 Configuration for all of them is in `pyproject.toml`.

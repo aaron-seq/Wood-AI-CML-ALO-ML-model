@@ -86,6 +86,34 @@ def parse_bytes(payload: bytes, filename: str | None) -> pd.DataFrame:
     return frame
 
 
+def parse_within_limits(
+    payload: bytes, filename: str | None, max_bytes: int, max_rows: int
+) -> pd.DataFrame:
+    """Size-check and parse upload bytes.
+
+    The whole upload contract in one synchronous function, so the API and
+    the dashboard enforce identical limits and produce identical messages.
+    The dashboard previously called pandas directly and enforced nothing.
+
+    Raises:
+        UploadError: If the upload is oversized, unsupported or unparseable.
+    """
+    if len(payload) > max_bytes:
+        raise UploadError(
+            f"File is too large ({len(payload) / 1_048_576:.1f} MB). "
+            f"The limit is {max_bytes / 1_048_576:.0f} MB."
+        )
+
+    frame = parse_bytes(payload, filename)
+
+    if len(frame) > max_rows:
+        raise UploadError(
+            f"File contains {len(frame):,} rows, which exceeds the {max_rows:,} row limit."
+        )
+
+    return frame
+
+
 async def read_upload(
     file, max_bytes: int, max_rows: int, *, filename: str | None = None
 ) -> pd.DataFrame:
@@ -107,18 +135,7 @@ async def read_upload(
     name = filename if filename is not None else getattr(file, "filename", None)
 
     payload = await file.read()
-    if len(payload) > max_bytes:
-        raise UploadError(
-            f"File is too large ({len(payload) / 1_048_576:.1f} MB). "
-            f"The limit is {max_bytes / 1_048_576:.0f} MB."
-        )
-
-    frame = parse_bytes(payload, name)
-
-    if len(frame) > max_rows:
-        raise UploadError(
-            f"File contains {len(frame):,} rows, which exceeds the {max_rows:,} row limit."
-        )
+    frame = parse_within_limits(payload, name, max_bytes, max_rows)
 
     logger.info("Parsed upload %s: %d rows, %d columns", name, len(frame), len(frame.columns))
     return frame

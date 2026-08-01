@@ -55,7 +55,11 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["app", "ml"]
+# streamlit_app.py is deliberately absent: AppTest executes the script
+# rather than importing it, so coverage cannot attribute those lines. It
+# is covered by tests/test_dashboard.py -- just not countable here, and a
+# number we cannot measure is worse than an honest omission.
+source = ["app", "ml", "api_client"]
 omit = ["*/__init__.py"]
 
 [tool.coverage.report]
