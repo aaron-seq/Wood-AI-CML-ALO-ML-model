@@ -20,7 +20,7 @@ invocations so local runs and CI cannot diverge.
 5. Open a PR describing what changed and why.
 
 Coverage must not go down; the build fails below 90%. It currently sits at
-93% of `app/` and `ml/`.
+91% of `app/`, `ml/` and `api_client.py`.
 
 Test order is randomised on every run (`pytest-randomly`); the seed is
 printed, and `-p no:randomly` disables it. A test that only passes in one

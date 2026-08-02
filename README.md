@@ -11,7 +11,7 @@ override system exists because an engineer, not the model, owns the call.
 
 [![CI](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
-![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-91%25-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
