@@ -4,7 +4,7 @@
 
 ```bash
 make setup   # .venv + all dependencies
-make check   # lint + format + tests — exactly what CI runs
+make check   # lint, types, audit, tests — exactly what CI runs
 ```
 
 `make help` lists every target. Use them rather than raw `pytest`/`ruff`
@@ -19,7 +19,23 @@ invocations so local runs and CI cannot diverge.
 4. `make check` must be green before you push.
 5. Open a PR describing what changed and why.
 
-Coverage must not go down. It currently sits at 87% of `app/` and `ml/`.
+Coverage must not go down; the build fails below 90%. It currently sits at
+91% of `app/`, `ml/` and `api_client.py`.
+
+Test order is randomised on every run (`pytest-randomly`); the seed is
+printed, and `-p no:randomly` disables it. A test that only passes in one
+order is a test with a hidden dependency.
+
+The Streamlit dashboard is tested with `streamlit.testing.v1.AppTest`
+(`tests/test_dashboard.py`), which runs the script in-process. Coverage
+cannot attribute those lines because AppTest executes rather than imports
+the script, so `streamlit_app.py` is absent from the coverage source --
+tested, but not counted.
+
+Numeric code should carry a property test as well as examples. The
+invariants in `tests/test_properties.py` found three overflow bugs that
+example-based tests had missed — state what must be true for *every*
+input, not just the inputs you thought of.
 
 ## Standards
 
@@ -47,6 +63,11 @@ applies them. Beyond that:
 - **Feature engineering goes in `app/features.py`**, which the API, the trainer
   and the analytics module all share. Do not add a local copy of a formula
   ([ADR-0003](docs/adr/0003-share-feature-engineering-between-training-and-serving.md)).
+- **Risk levels and inspection intervals come from `app/risk.py`.** Three
+  copies of that logic drifted into disagreeing on 70% of CMLs
+  ([ADR-0005](docs/adr/0005-single-risk-classifier.md)).
+- **Type annotations are checked.** `make typecheck` must pass; new modules
+  should be fully annotated.
 
 ## Before adding code
 
@@ -66,8 +87,10 @@ Say so explicitly in the PR, and include a rollback plan:
 | Model artifact or feature set | Changes predictions. Include before/after metrics and retrain against `data/cml_sample_500.csv` |
 | `scikit-learn` pin | Requires retraining — the artifact is a pickle. Follow [DEPLOYMENT.md](docs/DEPLOYMENT.md#upgrading-scikit-learn) and commit requirements, artifact and metadata together |
 | Upload limits | These bound worker memory |
-| CORS or anything auth-adjacent | Security surface |
-| SME override storage format | Existing audit trails must stay readable |
+| CORS, `app/security.py` or anything auth-adjacent | Security surface. Auth must stay disabled by default |
+| Calibration or the probability contract | See [ADR-0007](docs/adr/0007-calibration-measured-and-declined.md) before re-enabling |
+| SME override storage format | Existing audit trails must stay readable, and writes must stay atomic |
+| Risk thresholds in `app/risk.py` | Changes what gets inspected and when |
 | CI or Dockerfile | Affects everything downstream |
 
 ## Architecture decisions

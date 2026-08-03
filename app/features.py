@@ -26,8 +26,27 @@ MAX_REMAINING_LIFE_YEARS = 50.0
 DEFAULT_MINIMUM_THICKNESS_MM = 3.0
 DEFAULT_DAYS_SINCE_INSPECTION = 365
 
+# A corrosion rate below this is treated as no corrosion at all. One
+# nanometre of wall loss per year is far under what any inspection
+# technique resolves, so the distinction is not physically meaningful --
+# but arithmetically it matters a great deal: dividing by a denormal float
+# overflows back to the infinity the guard exists to prevent. Found by the
+# property tests in tests/test_properties.py.
+MIN_MEASURABLE_CORROSION_RATE = 1e-6
+
+# The same reasoning for the other divisor. A "wall" thinner than a
+# nanometre is not a measurement, and dividing by one overflows.
+MIN_MEASURABLE_THICKNESS_MM = 1e-6
+
 #: Columns a caller must supply before features can be engineered.
 BASE_NUMERIC_COLUMNS = ("average_corrosion_rate", "thickness_mm")
+
+#: Optional per-row minimum allowable thickness. Real inspection
+#: programmes derive this per circuit from design pressure and material,
+#: so a single global floor is a simplification. When the column is
+#: present it wins, row by row; when it is absent the global default
+#: applies, which is the historical behaviour.
+MINIMUM_THICKNESS_COLUMN = "minimum_thickness_mm"
 
 #: Columns this module adds to a CML frame.
 ENGINEERED_COLUMNS = (
@@ -38,19 +57,40 @@ ENGINEERED_COLUMNS = (
 )
 
 
+def resolve_minimum_thickness(
+    df: pd.DataFrame, default: float = DEFAULT_MINIMUM_THICKNESS_MM
+) -> pd.Series:
+    """Per-row minimum allowable thickness.
+
+    Uses :data:`MINIMUM_THICKNESS_COLUMN` where the caller supplies it and
+    the value is usable, falling back to ``default`` elsewhere. A
+    non-positive or unparseable entry falls back rather than producing a
+    nonsensical remaining life.
+    """
+    if MINIMUM_THICKNESS_COLUMN not in df.columns:
+        return pd.Series(float(default), index=df.index, dtype="float64")
+
+    supplied = pd.to_numeric(df[MINIMUM_THICKNESS_COLUMN], errors="coerce")
+    return supplied.where(supplied > 0, float(default)).astype("float64")
+
+
 def remaining_life_years(
     thickness_mm: pd.Series,
     corrosion_rate: pd.Series,
-    minimum_thickness_mm: float = DEFAULT_MINIMUM_THICKNESS_MM,
+    minimum_thickness_mm: float | pd.Series = DEFAULT_MINIMUM_THICKNESS_MM,
 ) -> pd.Series:
     """Years until ``thickness_mm`` corrodes down to ``minimum_thickness_mm``.
 
     Implements the API 570 remaining-life formula
-    ``(t_actual - t_minimum) / corrosion_rate`` with two guards:
+    ``(t_actual - t_minimum) / corrosion_rate`` with three guards, in
+    order of precedence:
 
-    * a non-positive corrosion rate yields :data:`MAX_REMAINING_LIFE_YEARS`
-      rather than infinity;
-    * a wall already at or below the minimum yields ``0.0``.
+    * a wall already at or below the minimum yields ``0.0``, whatever the
+      corrosion rate -- there is no metal left to consume;
+    * a rate below :data:`MIN_MEASURABLE_CORROSION_RATE` (including zero
+      and negative) yields :data:`MAX_REMAINING_LIFE_YEARS` rather than
+      infinity or an overflow;
+    * an unparseable reading yields ``0.0`` rather than propagating NaN.
 
     Values are otherwise left uncapped, because the model was trained on
     the uncapped column and capping here would introduce train/serve skew.
@@ -58,28 +98,46 @@ def remaining_life_years(
     thickness = pd.to_numeric(thickness_mm, errors="coerce")
     rate = pd.to_numeric(corrosion_rate, errors="coerce")
 
-    available = thickness - minimum_thickness_mm
-    life = pd.Series(
-        np.divide(
-            available.to_numpy(dtype="float64"),
-            rate.to_numpy(dtype="float64"),
-            out=np.full(len(rate), MAX_REMAINING_LIFE_YEARS, dtype="float64"),
-            where=rate.to_numpy(dtype="float64") > 0,
-        ),
-        index=thickness.index,
+    available = (thickness - minimum_thickness_mm).to_numpy(dtype="float64")
+    rate_values = rate.to_numpy(dtype="float64")
+
+    # A wall already at or below its minimum has no life left, whatever
+    # the corrosion rate -- including no corrosion at all. Checked before
+    # the rate branch because CMLForecaster checks it first, and the two
+    # disagreed here: features reported the 50-year ceiling where the
+    # forecaster reported zero.
+    exhausted = ~(available > 0)
+    corroding = (rate_values >= MIN_MEASURABLE_CORROSION_RATE) & ~exhausted
+
+    life_values = np.divide(
+        available,
+        rate_values,
+        # Everything not actively corroding starts at the ceiling; the
+        # exhausted rows are then zeroed below.
+        out=np.full(len(rate_values), MAX_REMAINING_LIFE_YEARS, dtype="float64"),
+        where=corroding,
     )
+    life_values[exhausted] = 0.0
+
+    life = pd.Series(life_values, index=thickness.index)
+    # NaN inputs land here as 0.0 rather than propagating into the model.
     return life.clip(lower=0.0).fillna(0.0)
 
 
 def corrosion_thickness_ratio(corrosion_rate: pd.Series, thickness_mm: pd.Series) -> pd.Series:
-    """Corrosion rate per mm of remaining wall, ``0.0`` where thickness is unusable."""
+    """Corrosion rate per mm of remaining wall, ``0.0`` where thickness is unusable.
+
+    ``> 0`` is not a sufficient guard: it admits denormal floats, and
+    dividing by one overflows to infinity. Found by the property tests.
+    """
     rate = pd.to_numeric(corrosion_rate, errors="coerce").to_numpy(dtype="float64")
     thickness = pd.to_numeric(thickness_mm, errors="coerce")
+    thickness_values = thickness.to_numpy(dtype="float64")
     ratio = np.divide(
         rate,
-        thickness.to_numpy(dtype="float64"),
+        thickness_values,
         out=np.zeros(len(rate), dtype="float64"),
-        where=thickness.to_numpy(dtype="float64") > 0,
+        where=thickness_values >= MIN_MEASURABLE_THICKNESS_MM,
     )
     return pd.Series(ratio, index=thickness.index).fillna(0.0)
 
@@ -110,8 +168,11 @@ def engineer_features(
 
     Args:
         df: CML records containing at least the columns in
-            :data:`BASE_NUMERIC_COLUMNS`.
-        minimum_thickness_mm: Minimum allowable wall thickness.
+            :data:`BASE_NUMERIC_COLUMNS`. An optional
+            :data:`MINIMUM_THICKNESS_COLUMN` overrides the default floor
+            per row.
+        minimum_thickness_mm: Fallback minimum allowable wall thickness,
+            used for rows that do not supply their own.
         now: Reference time for inspection-age calculations; defaults to
             the current time. Injectable so tests are deterministic.
 
@@ -126,6 +187,7 @@ def engineer_features(
         raise KeyError(f"Missing required column(s): {', '.join(missing)}")
 
     out = df.copy()
+    minimum_thickness = resolve_minimum_thickness(out, minimum_thickness_mm)
     out["corrosion_thickness_ratio"] = corrosion_thickness_ratio(
         out["average_corrosion_rate"], out["thickness_mm"]
     )
@@ -141,12 +203,12 @@ def engineer_features(
             out["remaining_life_years"], errors="coerce"
         ).fillna(
             remaining_life_years(
-                out["thickness_mm"], out["average_corrosion_rate"], minimum_thickness_mm
+                out["thickness_mm"], out["average_corrosion_rate"], minimum_thickness
             )
         )
     else:
         out["remaining_life_years"] = remaining_life_years(
-            out["thickness_mm"], out["average_corrosion_rate"], minimum_thickness_mm
+            out["thickness_mm"], out["average_corrosion_rate"], minimum_thickness
         )
 
     if "last_inspection_date" in out.columns:

@@ -12,6 +12,8 @@ from typing import Any
 
 import pandas as pd
 
+from app import risk
+
 logger = logging.getLogger(__name__)
 
 # Constants for validation thresholds
@@ -23,14 +25,7 @@ MIN_THICKNESS_MM = 0.0
 # Constants for inspection scheduling
 DEFAULT_MIN_THICKNESS_MM = 3.0
 DEFAULT_SAFETY_FACTOR = 1.5
-MIN_INSPECTION_INTERVAL_YEARS = 1
-MAX_INSPECTION_INTERVAL_YEARS = 6
 MAX_REMAINING_LIFE_YEARS = 50.0
-
-# Risk level thresholds (years)
-CRITICAL_RISK_THRESHOLD_YEARS = 2
-HIGH_RISK_THRESHOLD_YEARS = 5
-MEDIUM_RISK_THRESHOLD_YEARS = 10
 
 # Required column names
 REQUIRED_CML_COLUMNS = [
@@ -68,7 +63,12 @@ def validate_cml_dataframe(df: pd.DataFrame) -> dict[str, Any]:
         >>> if result['valid']:
         ...     print(f"Dataset has {result['stats']['total_records']} records")
     """
-    validation_results = {"valid": True, "errors": [], "warnings": [], "stats": {}}
+    validation_results: dict[str, Any] = {
+        "valid": True,
+        "errors": [],
+        "warnings": [],
+        "stats": {},
+    }
 
     try:
         # Check for empty dataframe
@@ -307,37 +307,23 @@ def calculate_inspection_schedule(
         remaining_life_years = available_thickness / corrosion_rate
         remaining_life_years = min(remaining_life_years, MAX_REMAINING_LIFE_YEARS)
 
-    # Calculate inspection interval with safety factor
-    if remaining_life_years == 0:
-        inspection_interval_years = 0.5  # Immediate attention needed
-    else:
-        inspection_interval_years = remaining_life_years / safety_factor
-        inspection_interval_years = max(
-            MIN_INSPECTION_INTERVAL_YEARS,
-            min(inspection_interval_years, MAX_INSPECTION_INTERVAL_YEARS),
-        )
+    # Interval and risk level both come from app.risk so this endpoint and
+    # the dashboard cannot report different answers for the same CML.
+    inspection_interval_months = risk.inspection_interval_months(
+        remaining_life_years, corrosion_rate, safety_factor
+    )
+    inspection_interval_years = inspection_interval_months / 12
 
-    # Calculate next inspection date
-    days_to_inspection = int(inspection_interval_years * 365)
-    next_inspection = datetime.now() + timedelta(days=days_to_inspection)
+    next_inspection = datetime.now() + timedelta(days=int(inspection_interval_years * 365))
 
-    # Determine risk level
-    if remaining_life_years < CRITICAL_RISK_THRESHOLD_YEARS:
-        risk_level = "CRITICAL"
-    elif remaining_life_years < HIGH_RISK_THRESHOLD_YEARS:
-        risk_level = "HIGH"
-    elif remaining_life_years < MEDIUM_RISK_THRESHOLD_YEARS:
-        risk_level = "MEDIUM"
-    else:
-        risk_level = "LOW"
+    risk_level = risk.classify(remaining_life_years, corrosion_rate, thickness)
 
-    # Calculate estimated thickness at next inspection
     thickness_loss = corrosion_rate * inspection_interval_years
     estimated_thickness = thickness - thickness_loss
 
     return {
         "remaining_life_years": round(remaining_life_years, 1),
-        "inspection_interval_months": int(inspection_interval_years * 12),
+        "inspection_interval_months": inspection_interval_months,
         "next_inspection_date": next_inspection.date(),
         "risk_level": risk_level,
         "estimated_thickness_at_next_inspection": round(estimated_thickness, 2),
@@ -379,7 +365,7 @@ def generate_elimination_report(predictions_df: pd.DataFrame) -> dict[str, Any]:
     eliminations = predictions_df[predictions_df["predicted_elimination"] == 1]
     keep_cmls = predictions_df[predictions_df["predicted_elimination"] == 0]
 
-    report = {
+    report: dict[str, Any] = {
         "summary": {
             "total_cmls": total_cmls,
             "recommended_eliminations": len(eliminations),

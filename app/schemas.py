@@ -76,6 +76,10 @@ class HealthResponse(BaseModel):
     model_loaded: bool = Field(..., description="Whether ML model is loaded")
     model_path: str | None = Field(None, description="Path to model file")
     version: str = Field(..., description="API version")
+    auth: str = Field(
+        "disabled",
+        description="Which endpoints require X-API-Key: 'disabled', 'writes' or 'all'",
+    )
 
 
 class UploadResponse(BaseModel):
@@ -100,16 +104,39 @@ class ModelInfo(BaseModel):
     trained_date: datetime | None = Field(None, description="When the model was trained")
 
 
+class AppliedOverride(BaseModel):
+    """The expert decision that superseded the model for one CML."""
+
+    sme_decision: str = Field(..., description="The expert's decision: KEEP or ELIMINATE")
+    sme_name: str | None = Field(None, description="Who recorded it")
+    reason: str | None = Field(None, description="Why the model was overruled")
+    override_date: str | None = Field(None, description="When it was recorded")
+
+
 class PredictionResult(BaseModel):
     """Single prediction result for score endpoint."""
 
     id_number: str = Field(..., description="CML identifier")
-    predicted_elimination_flag: int = Field(..., ge=0, le=1, description="0=Keep, 1=Eliminate")
-    elimination_probability: float = Field(
-        ..., ge=0.0, le=1.0, description="Probability of elimination"
+    predicted_elimination_flag: int = Field(
+        ..., ge=0, le=1, description="Raw model output: 0=Keep, 1=Eliminate"
     )
-    recommendation: str = Field(..., description="KEEP or ELIMINATE")
-    confidence: str = Field(..., description="Confidence level")
+    elimination_probability: float = Field(
+        ..., ge=0.0, le=1.0, description="Uncalibrated probability of elimination"
+    )
+    model_recommendation: str = Field(
+        ..., description="What the model alone recommended: KEEP or ELIMINATE"
+    )
+    recommendation: str = Field(
+        ...,
+        description=(
+            "The decision to act on: the SME override when one exists, "
+            "otherwise model_recommendation"
+        ),
+    )
+    confidence: str = Field(..., description="Confidence level of the model prediction")
+    sme_override: AppliedOverride | None = Field(
+        None, description="Present only when an expert has overruled the model for this CML"
+    )
 
 
 class ScoreResponse(BaseModel):
@@ -163,6 +190,11 @@ class ScoreResponse(BaseModel):
     )
     results_truncated: bool = Field(
         False, description="True when 'results' holds fewer entries than 'total_results'"
+    )
+    offset: int = Field(0, ge=0, description="Index of the first result in this page")
+    limit: int = Field(0, ge=0, description="Maximum results this page could hold")
+    sme_overrides_applied: int = Field(
+        0, ge=0, description="How many scored CMLs carried an expert override"
     )
     model_info: ModelInfo = Field(..., description="Model metadata")
     message: str | None = Field(None, description="Processing message")

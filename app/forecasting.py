@@ -1,10 +1,17 @@
 """CML Remaining Life Forecasting Module."""
 
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 
 import pandas as pd
 
-from app.features import MAX_REMAINING_LIFE_YEARS
+from app import risk
+from app.features import (
+    MAX_REMAINING_LIFE_YEARS,
+    MIN_MEASURABLE_CORROSION_RATE,
+    MINIMUM_THICKNESS_COLUMN,
+)
 
 
 class CMLForecaster:
@@ -26,7 +33,7 @@ class CMLForecaster:
         self,
         current_thickness: float,
         corrosion_rate: float,
-        min_thickness: float = None,
+        min_thickness: float | None = None,
     ) -> float:
         """Calculate remaining life in years."""
         if min_thickness is None:
@@ -37,7 +44,9 @@ class CMLForecaster:
         if available_thickness <= 0:
             return 0.0
 
-        if corrosion_rate <= 0:
+        # Same epsilon as app.features: a rate below it is not measurable
+        # corrosion, and dividing by it overflows.
+        if corrosion_rate < MIN_MEASURABLE_CORROSION_RATE:
             return MAX_REMAINING_LIFE_YEARS
 
         remaining_life = available_thickness / corrosion_rate
@@ -46,22 +55,18 @@ class CMLForecaster:
     def calculate_inspection_interval(
         self, remaining_life_years: float, corrosion_rate: float
     ) -> int:
-        """Calculate recommended inspection interval in months."""
-        safe_interval_years = remaining_life_years / self.safety_factor
+        """Recommended inspection interval in months.
 
-        interval_months = int(safe_interval_years * 12)
-
-        # Apply corrosion rate adjustment
-        if corrosion_rate > 0.20:
-            interval_months = int(interval_months * 0.7)
-        elif corrosion_rate < 0.05:
-            interval_months = int(interval_months * 1.3)
-
-        # Clamp to min/max
-        interval_months = max(self.min_inspection_interval, interval_months)
-        interval_months = min(self.max_inspection_interval, interval_months)
-
-        return interval_months
+        Delegates to app.risk so the dashboard and the
+        /forecast-remaining-life endpoint cannot disagree.
+        """
+        return risk.inspection_interval_months(
+            remaining_life_years,
+            corrosion_rate,
+            self.safety_factor,
+            min_months=self.min_inspection_interval,
+            max_months=self.max_inspection_interval,
+        )
 
     def calculate_next_inspection_date(
         self, last_inspection_date: datetime, interval_months: int
@@ -82,23 +87,16 @@ class CMLForecaster:
         corrosion_rate: float,
         current_thickness: float,
     ) -> str:
-        """Determine risk level for CML."""
-        if remaining_life_years < 1 or current_thickness < 5:
-            return "CRITICAL"
-        elif remaining_life_years < 3 or corrosion_rate > 0.25:
-            return "HIGH"
-        elif remaining_life_years < 7 or corrosion_rate > 0.15:
-            return "MEDIUM"
-        else:
-            return "LOW"
+        """Determine the risk level for a CML. See app.risk for the rule."""
+        return risk.classify(remaining_life_years, corrosion_rate, current_thickness)
 
     def forecast_single_cml(
         self,
         id_number: str,
         current_thickness: float,
         corrosion_rate: float,
-        last_inspection_date: datetime = None,
-        minimum_thickness: float = None,
+        last_inspection_date: datetime | None = None,
+        minimum_thickness: float | None = None,
     ) -> dict:
         """Generate complete forecast for a single CML."""
         if last_inspection_date is None:
@@ -132,9 +130,11 @@ class CMLForecaster:
             "corrosion_rate_mm_per_year": corrosion_rate,
         }
 
-    def forecast_batch(self, df: pd.DataFrame, minimum_thickness: float = None) -> pd.DataFrame:
+    def forecast_batch(
+        self, df: pd.DataFrame, minimum_thickness: float | None = None
+    ) -> pd.DataFrame:
         """Generate forecasts for multiple CMLs."""
-        forecasts = []
+        forecasts: list[dict] = []
 
         for _, row in df.iterrows():
             last_inspection = None
@@ -147,12 +147,20 @@ class CMLForecaster:
                 except Exception:
                     pass  # Use None if date parsing fails
 
+            # A per-row minimum allowable thickness, where the source
+            # data carries one, beats both the argument and the instance
+            # default -- real programmes set this per circuit.
+            row_minimum = minimum_thickness
+            supplied = row.get(MINIMUM_THICKNESS_COLUMN)
+            if supplied is not None and pd.notna(supplied) and float(supplied) > 0:
+                row_minimum = float(supplied)
+
             forecast = self.forecast_single_cml(
                 id_number=row.get("id_number", f"CML-{len(forecasts) + 1}"),
                 current_thickness=row["thickness_mm"],
                 corrosion_rate=row["average_corrosion_rate"],
                 last_inspection_date=last_inspection,
-                minimum_thickness=minimum_thickness,
+                minimum_thickness=row_minimum,
             )
             forecasts.append(forecast)
 

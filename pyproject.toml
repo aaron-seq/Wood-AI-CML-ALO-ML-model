@@ -55,9 +55,35 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["app", "ml"]
+# streamlit_app.py is deliberately absent: AppTest executes the script
+# rather than importing it, so coverage cannot attribute those lines. It
+# is covered by tests/test_dashboard.py -- just not countable here, and a
+# number we cannot measure is worse than an honest omission.
+source = ["app", "ml", "api_client"]
 omit = ["*/__init__.py"]
 
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
+# A floor, not a target. Set just below the current figure so a genuine
+# drop fails the build while ordinary refactoring does not thrash it.
+fail_under = 90
+
+[tool.mypy]
+python_version = "3.11"
+files = ["app", "ml"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+# The codebase is progressively typed: annotations are required on new and
+# refactored modules, but existing helpers are not blocked on a full pass.
+disallow_untyped_defs = false
+
+# Third-party packages that ship no type information. Listing them
+# explicitly means a *new* untyped import is reported rather than silently
+# absorbed by a blanket ignore_missing_imports = true.
+[[tool.mypy.overrides]]
+module = ["joblib.*", "plotly.*", "sklearn.*"]
+ignore_missing_imports = true

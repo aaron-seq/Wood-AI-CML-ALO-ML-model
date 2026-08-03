@@ -3,8 +3,28 @@
 Base URL `http://localhost:8000`. Interactive docs at `/docs`, OpenAPI schema
 at `/openapi.json`.
 
-There is **no authentication**. Anything that can reach the port can score
-data and write SME overrides — deploy behind an authenticating gateway.
+## Authentication
+
+Off by default: with `API_KEY` unset every endpoint is open, which is the
+historical behaviour. Set it (16+ characters) and callers must send
+`X-API-Key`.
+
+| `API_KEY_SCOPE` | Gated |
+| --- | --- |
+| `writes` (default) | `POST`/`DELETE /sme-override` |
+| `all` | Everything except `/` and `/health` |
+
+`/` and `/health` are never gated — an orchestrator cannot attach
+credentials to a liveness probe. `GET /health` reports the active posture
+as `"auth": "disabled" | "writes" | "all"`, never the key itself.
+
+A rejected request returns `401` with `WWW-Authenticate: X-API-Key`.
+Missing and incorrect keys give byte-identical responses so the error
+cannot be used to probe for valid keys.
+
+This is a shared secret, not an identity system: the `sme_name` recorded on
+an override remains self-declared. Attributing decisions to a verified
+identity still requires real authentication upstream.
 
 ## Conventions
 
@@ -17,6 +37,7 @@ client-side report with server logs; otherwise one is generated.
 | `400` | The request is wrong: bad format, too large, missing columns |
 | `404` | No such SME override |
 | `422` | JSON body failed schema validation (FastAPI's own shape) |
+| `401` | Authentication is enabled and the `X-API-Key` header is missing or wrong |
 | `500` | Server fault — model inference or persistence failed |
 | `503` | No model artifact is loaded |
 
@@ -79,6 +100,28 @@ always reflects the model actually serving traffic.
 
 ---
 
+## `GET /metrics`
+
+Prometheus text-format metrics for the process. Returns `404` unless
+`METRICS_ENABLED` is true, so an unconfigured deployment does not publish
+its traffic volume.
+
+```
+cml_requests_total{method="POST",path="/score-cml-data",status="200"} 12
+cml_request_duration_seconds_total{method="POST",path="/score-cml-data"} 3.481
+cml_scored_total 6000
+cml_sme_overrides_applied_total 4
+cml_process_uptime_seconds 842.117
+```
+
+Counters are process-local and reset on restart, which is what a scrape
+expects of a counter it will `rate()`. Path labels use the route template,
+not the literal URL, so a per-CML `DELETE` does not mint a metric series
+per id.
+
+`cml_sme_overrides_applied_total` against `cml_scored_total` is how often
+experts are overruling the model — worth alerting on if it climbs.
+
 ## `POST /upload-cml-data`
 
 Parse and validate without scoring — a dry run for checking a file's schema.
@@ -132,12 +175,15 @@ curl -X POST http://localhost:8000/score-cml-data -F "file=@data/cml_sample_500.
       "id_number": "CML-001",
       "predicted_elimination_flag": 0,
       "elimination_probability": 0.23,
+      "model_recommendation": "KEEP",
       "recommendation": "KEEP",
-      "confidence": "HIGH"
+      "confidence": "HIGH",
+      "sme_override": null
     }
   ],
   "total_results": 500,
   "results_truncated": true,
+  "sme_overrides_applied": 0,
   "model_info": { "model_type": "Pipeline", "features_used": ["..."] },
   "message": "Successfully scored 500 CML records"
 }
@@ -145,16 +191,35 @@ curl -X POST http://localhost:8000/score-cml-data -F "file=@data/cml_sample_500.
 
 | Field | Notes |
 | --- | --- |
-| `predicted_elimination_flag` | `0` keep, `1` eliminate |
+| `predicted_elimination_flag` | Raw model output: `0` keep, `1` eliminate |
 | `elimination_probability` | Random Forest vote share in `[0, 1]`. **Not calibrated** — do not read it as a true probability |
-| `recommendation` | `KEEP` or `ELIMINATE`; always agrees with the flag |
+| `model_recommendation` | What the model alone said; always agrees with the flag |
+| `recommendation` | **The decision to act on.** Equals `model_recommendation` unless an expert has overruled it |
+| `sme_override` | `null`, or the expert decision with who recorded it, when and why |
+| `sme_overrides_applied` | How many rows in the batch carried an override |
 | `confidence` | `HIGH` when more than 0.3 from the 0.5 boundary, else `MODERATE`. A distance measure, not a validated interval |
-| `results` | Capped at 100 entries |
+| `results` | One page; see the paging parameters below |
 | `total_results` | The true count, always |
 | `results_truncated` | `true` when `results` is a partial view |
 
+### Paging
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `offset` | `0` | Index of the first result to return |
+| `limit` | `MAX_RESULTS_IN_RESPONSE` (100) | Maximum results in this page |
+
+Every row is always scored; these page over the response body only.
+Omitting both reproduces the previous behaviour exactly.
+
+```bash
+curl -X POST "http://localhost:8000/score-cml-data?offset=100&limit=100" \
+  -F "file=@data/cml_sample_500.csv"
+```
+
 Rows whose corrosion rate is zero score normally. Errors: `400` (bad or
-incomplete file), `503` (no model), `500` (inference failed).
+incomplete file), `401` (auth enabled, key missing), `503` (no model),
+`500` (inference failed).
 
 ---
 
@@ -177,9 +242,29 @@ deterministic arithmetic, so it works even when the API is degraded.
 ]
 ```
 
-`risk_level` comes from remaining life: `CRITICAL` under 2 years, `HIGH` under
-5, `MEDIUM` under 10, otherwise `LOW`. Intervals are clamped to 1–6 years
-after the safety factor. A row with unusable values is skipped and logged with
+A `minimum_thickness_mm` column, where present, sets the minimum allowable
+thickness per row instead of the global 3.0 mm default — which is how real
+programmes work, since the floor derives from design pressure and material
+per circuit. A missing, non-positive or unparseable value falls back to the
+default rather than producing a nonsensical remaining life.
+
+`risk_level` comes from `app/risk.py`, the single classifier shared with the
+dashboard and the analytics charts. A CML takes a level if **any** of its
+conditions holds:
+
+| Level | Conditions |
+| --- | --- |
+| `CRITICAL` | remaining life < 1 year, **or** wall thinner than 5 mm |
+| `HIGH` | remaining life < 3 years, **or** rate > 0.25 mm/yr |
+| `MEDIUM` | remaining life < 7 years, **or** rate > 0.15 mm/yr |
+| `LOW` | none of the above |
+
+Thickness is part of the test on purpose: a wall near its minimum has
+almost no material left however slowly it is corroding, and a
+remaining-life-only rule scored exactly that case as `LOW`.
+
+Intervals are clamped to 1–6 years after the safety factor, shortened for
+CMLs corroding faster than 0.20 mm/yr and extended below 0.05 mm/yr. A row with unusable values is skipped and logged with
 a count rather than failing the batch.
 
 ---
@@ -218,6 +303,11 @@ engineer's attention: the model is closest to indifferent there.
 
 Expert decisions that supersede the model, kept as an audit trail. Keyed by
 CML id.
+
+Overrides are applied automatically. Once an expert records a decision for
+a CML, every later scoring run returns it as the `recommendation` while
+still reporting the model's own view in `model_recommendation` — the
+override does not erase the audit trail.
 
 ### `POST /sme-override` → `201`
 

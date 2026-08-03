@@ -108,3 +108,68 @@ class TestEndToEndTraining:
         metrics = trainer.train_model(X, y, preprocessor, param_grid={})
 
         assert metrics["roc_auc"] > 0.8
+
+
+class TestCalibration:
+    """Calibration is available but off by default.
+
+    It is off because it was measured and did not pay for itself on the
+    bundled data -- see docs/MODEL_CARD.md. These tests pin the plumbing
+    so the option stays usable when a larger dataset makes it worthwhile.
+    """
+
+    def test_off_by_default(self, training_csv, tmp_path):
+        assert EnhancedCMLModelTrainer(training_csv, tmp_path / "models").calibration is None
+
+    @pytest.mark.parametrize("method", ["sigmoid", "isotonic"])
+    def test_accepts_the_supported_methods(self, training_csv, tmp_path, method):
+        trainer = EnhancedCMLModelTrainer(training_csv, tmp_path / "models", calibration=method)
+        assert trainer.calibration == method
+
+    def test_rejects_an_unknown_method(self, training_csv, tmp_path):
+        with pytest.raises(ValueError, match="Unknown calibration method"):
+            EnhancedCMLModelTrainer(training_csv, tmp_path / "models", calibration="magic")
+
+    @pytest.mark.slow
+    def test_a_calibrated_model_still_predicts(self, training_csv, tmp_path):
+        trainer = EnhancedCMLModelTrainer(training_csv, tmp_path / "models", calibration="sigmoid")
+        engineered = trainer.engineer_features(trainer.load_data())
+        X, y, preprocessor = trainer.prepare_features(engineered)
+
+        metrics = trainer.train_model(X, y, preprocessor, param_grid={})
+
+        assert metrics["calibration"] == "sigmoid"
+        assert set(trainer.model.predict(X.head(5))).issubset({0, 1})
+        probabilities = trainer.model.predict_proba(X.head(5))[:, 1]
+        assert ((probabilities >= 0) & (probabilities <= 1)).all()
+
+    @pytest.mark.slow
+    def test_calibration_quality_is_always_measured(self, training_csv, tmp_path):
+        """An uncalibrated model must still report how uncalibrated it is."""
+        trainer = EnhancedCMLModelTrainer(training_csv, tmp_path / "models")
+        engineered = trainer.engineer_features(trainer.load_data())
+        X, y, preprocessor = trainer.prepare_features(engineered)
+
+        metrics = trainer.train_model(X, y, preprocessor, param_grid={})
+
+        assert 0.0 <= metrics["brier_score"] <= 1.0
+        assert 0.0 <= metrics["expected_calibration_error"] <= 1.0
+        assert metrics["log_loss"] > 0
+        assert metrics["calibration"] is None
+
+
+class TestExpectedCalibrationError:
+    def test_perfect_calibration_scores_zero(self):
+        from ml.train_enhanced import _expected_calibration_error
+
+        # Half the samples at p=0.0 are negative, half at p=1.0 positive.
+        y_true = np.array([0, 0, 1, 1])
+        probabilities = np.array([0.0, 0.0, 1.0, 1.0])
+        assert _expected_calibration_error(y_true, probabilities) == pytest.approx(0.0)
+
+    def test_confident_and_wrong_scores_one(self):
+        from ml.train_enhanced import _expected_calibration_error
+
+        y_true = np.array([0, 0, 0, 0])
+        probabilities = np.array([1.0, 1.0, 1.0, 1.0])
+        assert _expected_calibration_error(y_true, probabilities) == pytest.approx(1.0)

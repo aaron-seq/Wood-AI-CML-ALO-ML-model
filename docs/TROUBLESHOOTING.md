@@ -88,10 +88,57 @@ API-only. Use `requirements-streamlit.txt` for the dashboard.
 
 ## Results look truncated
 
-They are, by design. `/score-cml-data` echoes at most 100 rows.
-`total_results` is the true count and `results_truncated` flags the partial
-view; the dashboard shows a notice when it applies. Raise
-`MAX_RESULTS_IN_RESPONSE` if you need more in one body.
+By default `/score-cml-data` returns the first 100 rows; `total_results` is
+the true count and `results_truncated` flags the partial view. Every row is
+always scored — the cap applies to the response body only.
+
+Page through the rest rather than re-uploading:
+
+```bash
+curl -X POST "localhost:8000/score-cml-data?offset=100&limit=100" \
+  -F "file=@data/cml_sample_500.csv"
+```
+
+Or raise `MAX_RESULTS_IN_RESPONSE` to change the default page size.
+
+---
+
+## `401 A valid X-API-Key header is required`
+
+Authentication is enabled on the API. Send the key:
+
+```bash
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/sme-override
+```
+
+Check which endpoints are gated — `/health` reports the posture and is never
+gated itself:
+
+```bash
+curl -s localhost:8000/health   # {"auth": "disabled" | "writes" | "all"}
+```
+
+For the dashboard, set `CML_API_KEY` to match the API's `API_KEY`.
+
+Missing and wrong keys return identical responses on purpose, so the body
+will not tell you which it was — the server log will, keyed by request id.
+
+## The API refuses to start: "API_KEY must be at least 16 characters"
+
+Deliberate. A key short enough to guess implies protection that is not
+there. Generate one:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Or unset `API_KEY` entirely to run without authentication.
+
+## `/metrics` returns 404
+
+Metrics are off by default so an unconfigured deployment does not publish
+its traffic volume. Set `METRICS_ENABLED=true` and scrape from inside the
+network rather than through a public ingress.
 
 ---
 
@@ -177,9 +224,13 @@ docker compose cp api:/app/data/sme_overrides.json ./sme_overrides.backup.json
 
 ## Two people's overrides conflict
 
-The store rewrites the whole JSON file per write with no locking, so
-simultaneous writes can interleave and lose a decision. Run a single API
-replica until overrides move to a database
+Concurrent writes on one host are safe: each read-modify-write cycle takes an
+advisory lock, and the file is replaced atomically, so nothing interleaves and
+no decision is lost. Posting the same CML id twice is a deliberate replace —
+the newer decision wins, and the older one is gone.
+
+The lock does **not** coordinate across hosts or over a network filesystem.
+Run a single API replica until the store moves to a database
 ([DEPLOYMENT.md](DEPLOYMENT.md#future-work)).
 
 ---
@@ -201,6 +252,31 @@ Two things routinely surprise people:
   them from the source file. If your `remaining_life_years` was computed with a
   different formula or cap than the training data's, the model sees a
   differently-scaled feature. Drop the column to have it derived consistently.
+
+## A CML is flagged CRITICAL that used to be LOW
+
+Risk classification now includes wall thickness, not just remaining life.
+Anything thinner than 5 mm is CRITICAL regardless of how slowly it is
+corroding, because a wall near its minimum has almost no material left. The
+API and the dashboard previously disagreed here on 70% of CMLs; both now use
+`app/risk.py`. See [ADR-0005](adr/0005-single-risk-classifier.md).
+
+## The recommendation does not match the model prediction
+
+That is an override doing its job. Check `sme_override` on the result:
+
+```bash
+curl -s http://localhost:8000/sme-override | python -m json.tool
+```
+
+`recommendation` is the decision to act on; `model_recommendation` is what
+the model said on its own. Withdraw the override with
+`DELETE /sme-override/{id}` to fall back to the model.
+
+Before this was wired up, overrides were recorded but never applied — if
+you are comparing against older output, that is the difference.
+
+---
 
 An unknown commodity or feature type does not error: `handle_unknown="ignore"`
 means it contributes nothing to the prediction. Check

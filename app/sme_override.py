@@ -1,10 +1,32 @@
-"""SME (Subject Matter Expert) Override System."""
+"""SME (Subject Matter Expert) Override System.
 
+The override file is a compliance artifact: it records which engineer
+overruled the model, when, and why. It is therefore written atomically and
+under an advisory lock. The previous implementation opened the live file
+with mode "w" and dumped into it, so a crash or a concurrent writer part
+way through left a truncated -- unparseable -- audit trail.
+"""
+
+from __future__ import annotations
+
+import contextlib
 import json
+import logging
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+try:  # pragma: no cover - platform dependent
+    import fcntl
+
+    _HAVE_FLOCK = True
+except ImportError:  # pragma: no cover - Windows
+    _HAVE_FLOCK = False
 
 
 class SMEOverrideManager:
@@ -25,10 +47,55 @@ class SMEOverrideManager:
         except (FileNotFoundError, json.JSONDecodeError):
             return []
 
+    @contextlib.contextmanager
+    def _exclusive(self):
+        """Serialise read-modify-write cycles across processes.
+
+        Uses an advisory lock on a sidecar file, so the lock is never the
+        thing being replaced by the atomic rename below. Advisory locking
+        is unavailable on some platforms; there the block still runs, and
+        concurrent writers remain the caller's problem to avoid (see
+        docs/DEPLOYMENT.md on running a single replica).
+        """
+        if not _HAVE_FLOCK:
+            logger.debug("Advisory locking unavailable on this platform")
+            yield
+            return
+
+        lock_path = self.override_file.with_suffix(self.override_file.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
     def _save_overrides(self, overrides: list[dict]):
-        """Save overrides to file."""
-        with open(self.override_file, "w") as f:
-            json.dump(overrides, f, indent=2, default=str)
+        """Write the override list atomically.
+
+        Serialises to a temporary file in the same directory, flushes it
+        to disk, then renames over the target. os.replace is atomic within
+        a filesystem, so a reader sees either the old file or the new one
+        -- never a half-written one.
+        """
+        self.override_file.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=self.override_file.parent,
+            prefix=f".{self.override_file.name}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(overrides, handle, indent=2, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self.override_file)
+        except BaseException:
+            # Leave no stray temp file behind if serialisation failed.
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
+            raise
 
     def add_override(
         self,
@@ -53,20 +120,23 @@ class SMEOverrideManager:
             "original_probability": original_probability,
         }
 
-        overrides = self._load_overrides()
+        # Read and write under one lock: two engineers submitting at the
+        # same time must not each write a list that omits the other.
+        with self._exclusive():
+            overrides = self._load_overrides()
 
-        existing_idx = None
-        for idx, ov in enumerate(overrides):
-            if ov["id_number"] == id_number:
-                existing_idx = idx
-                break
+            existing_idx = None
+            for idx, ov in enumerate(overrides):
+                if ov["id_number"] == id_number:
+                    existing_idx = idx
+                    break
 
-        if existing_idx is not None:
-            overrides[existing_idx] = override
-        else:
-            overrides.append(override)
+            if existing_idx is not None:
+                overrides[existing_idx] = override
+            else:
+                overrides.append(override)
 
-        self._save_overrides(overrides)
+            self._save_overrides(overrides)
 
         return override
 
@@ -84,16 +154,24 @@ class SMEOverrideManager:
         """Get all SME overrides."""
         return self._load_overrides()
 
+    def get_override_map(self) -> dict[str, dict]:
+        """Return every override keyed by CML id, for bulk lookup.
+
+        Scoring a file needs one read of the store, not one per row.
+        """
+        return {str(override["id_number"]): override for override in self._load_overrides()}
+
     def remove_override(self, id_number: str) -> bool:
         """Remove SME override for a specific CML."""
-        overrides = self._load_overrides()
+        with self._exclusive():
+            overrides = self._load_overrides()
 
-        original_length = len(overrides)
-        overrides = [ov for ov in overrides if ov["id_number"] != id_number]
+            original_length = len(overrides)
+            overrides = [ov for ov in overrides if ov["id_number"] != id_number]
 
-        if len(overrides) < original_length:
-            self._save_overrides(overrides)
-            return True
+            if len(overrides) < original_length:
+                self._save_overrides(overrides)
+                return True
 
         return False
 
@@ -186,7 +264,7 @@ class SMEOverrideManager:
         return stats
 
 
-def create_override_manager(override_file: Path = None) -> SMEOverrideManager:
+def create_override_manager(override_file: Path | None = None) -> SMEOverrideManager:
     """Factory function to create SME override manager."""
     if override_file is None:
         override_file = Path("data/sme_overrides.json")

@@ -9,6 +9,7 @@ or from an arbitrary working directory.
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -76,6 +77,28 @@ class Settings(BaseSettings):
     MAX_RESULTS_IN_RESPONSE: int = 100
 
     LOG_LEVEL: str = "INFO"
+    # "json" emits one structured object per line for log aggregators;
+    # "text" stays human-readable, which is the better local default.
+    LOG_FORMAT: Literal["text", "json"] = "text"
+    # /metrics is off unless enabled: it reveals traffic volume and should
+    # not be reachable from the internet by default.
+    METRICS_ENABLED: bool = False
+
+    # Optional shared-secret gate. Unset means no authentication, which
+    # is the historical behaviour and stays the default so upgrading does
+    # not lock anyone out. Set it, and callers must send X-API-Key.
+    API_KEY: str | None = None
+    # "writes": only endpoints that mutate the SME audit trail are gated.
+    # "all": scoring, reporting and metadata are gated too.
+    API_KEY_SCOPE: Literal["writes", "all"] = "writes"
+
+    @field_validator("API_KEY")
+    @classmethod
+    def _reject_trivial_key(cls, value: str | None) -> str | None:
+        """A key short enough to guess is worse than none: it implies safety."""
+        if value is not None and len(value) < 16:
+            raise ValueError("API_KEY must be at least 16 characters, or unset entirely")
+        return value
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod

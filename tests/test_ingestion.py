@@ -7,7 +7,7 @@ import io
 import pandas as pd
 import pytest
 
-from app.ingestion import UploadError, parse_bytes
+from app.ingestion import UploadError, parse_bytes, parse_within_limits
 
 
 def _csv_bytes(df: pd.DataFrame) -> bytes:
@@ -83,3 +83,35 @@ class TestRowLimit:
         response = client.post("/upload-cml-data", files=csv_upload(frame))
         assert response.status_code == 400
         assert "row limit" in response.json()["detail"]
+
+
+class TestParseWithinLimits:
+    """The single upload contract, shared by the API and the dashboard.
+
+    The dashboard used to call pandas directly and enforce no limits at
+    all, so it accepted files the API rejected and worded the same failure
+    differently.
+    """
+
+    def test_a_valid_file_parses(self, valid_cml_frame):
+        parsed = parse_within_limits(_csv_bytes(valid_cml_frame), "cml.csv", 10_000_000, 1000)
+        assert len(parsed) == 3
+
+    def test_an_oversized_payload_is_rejected_before_parsing(self):
+        with pytest.raises(UploadError, match="too large"):
+            parse_within_limits(b"x" * 2048, "cml.csv", max_bytes=1024, max_rows=1000)
+
+    def test_too_many_rows_is_rejected(self, valid_cml_frame):
+        with pytest.raises(UploadError, match="row limit"):
+            parse_within_limits(
+                _csv_bytes(valid_cml_frame), "cml.csv", max_bytes=10_000_000, max_rows=2
+            )
+
+    def test_format_errors_still_surface(self, valid_cml_frame):
+        with pytest.raises(UploadError, match="Unsupported file format"):
+            parse_within_limits(_csv_bytes(valid_cml_frame), "notes.txt", 10_000_000, 1000)
+
+    def test_the_size_check_runs_first(self):
+        """An oversized file must not be parsed just to learn it is oversized."""
+        with pytest.raises(UploadError, match="too large"):
+            parse_within_limits(b"\x00" * 2048, "cml.csv", max_bytes=1024, max_rows=1000)

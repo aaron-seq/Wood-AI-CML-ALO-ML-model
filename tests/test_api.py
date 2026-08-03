@@ -218,3 +218,52 @@ class TestCORS:
     def test_unlisted_origin_gets_no_allow_header(self, client):
         response = client.get("/health", headers={"Origin": "http://evil.example"})
         assert "access-control-allow-origin" not in response.headers
+
+
+class TestInferenceEquivalence:
+    """Predictions are derived from probabilities, not a second traversal.
+
+    ``predict`` and ``predict_proba`` each walk the whole forest, and the
+    API used to call both -- 84% of scoring time at 100k rows. Deriving
+    the class with an argmax halves it. This pins the equivalence so the
+    optimisation cannot silently change a recommendation.
+    """
+
+    def test_derived_predictions_match_sklearn_predict(self):
+        import numpy as np
+        import pandas as pd
+
+        from app.features import engineer_features
+        from app.main import _load_model, _predict
+
+        model = _load_model()
+        assert model is not None, "the committed artifact must load"
+
+        rng = np.random.default_rng(0)
+        rows = 2_000
+        frame = pd.DataFrame(
+            {
+                "id_number": [f"CML-{index}" for index in range(rows)],
+                "average_corrosion_rate": rng.uniform(0.0, 0.6, rows),
+                "thickness_mm": rng.uniform(2.0, 18.0, rows),
+                "commodity": rng.choice(["Crude Oil", "Steam", "Fuel Gas"], rows),
+                "feature_type": rng.choice(["Pipe", "Elbow", "Weld"], rows),
+                "cml_shape": rng.choice(["Both", "Internal", "External"], rows),
+            }
+        )
+        X = engineer_features(frame)[list(model.feature_names_in_)]
+
+        derived, probabilities = _predict(model, X)
+
+        assert np.array_equal(derived, model.predict(X))
+        assert np.allclose(probabilities, model.predict_proba(X)[:, 1])
+
+    def test_the_positive_class_column_is_located_not_assumed(self):
+        """Hardcoding column 1 breaks if classes_ is ever ordered differently."""
+        import numpy as np
+
+        from app.main import _load_model
+
+        model = _load_model()
+        assert list(model.classes_) == [0, 1]
+        assert int(np.where(model.classes_ == 1)[0][0]) == 1

@@ -1,0 +1,32 @@
+# Keeps dependencies current without silently breaking the model.
+#
+# Grouped so a routine bump is one reviewable PR rather than a dozen.
+# scikit-learn is deliberately excluded: the committed model artifact is a
+# pickle produced by a specific minor version, so bumping it requires
+# retraining. See docs/DEPLOYMENT.md, "Upgrading scikit-learn".
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+        exclude-patterns: ["scikit-learn"]
+    ignore:
+      - dependency-name: scikit-learn
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly

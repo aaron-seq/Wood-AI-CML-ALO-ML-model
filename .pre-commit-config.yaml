@@ -1,0 +1,39 @@
+# Runs the fast half of `make check` before a commit, so the slow half
+# (tests, audit) is the only thing left for CI to catch.
+#
+#   pip install pre-commit && pre-commit install
+#
+# Optional: nothing in the project depends on it, and CI re-runs every
+# check regardless. It exists to shorten the feedback loop, not to become
+# a second source of truth.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      # The model artifact is ~2 MB and belongs in git; anything much
+      # larger arriving by accident should be questioned.
+      - id: check-added-large-files
+        args: [--maxkb=5120]
+      # Catches an .env or a key pasted into a commit.
+      - id: detect-private-key
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.18.2
+    hooks:
+      - id: mypy
+        additional_dependencies: [pandas-stubs, types-requests, pydantic, pydantic-settings]
+        args: [--config-file=pyproject.toml]
+        pass_filenames: false
