@@ -47,15 +47,18 @@ class TestRemainingLifeInvariants:
         assert life != float("inf")
         assert life >= 0.0
 
-    @given(thickness=thicknesses, rate=rates, minimum=minimums)
-    def test_a_wall_at_or_below_the_minimum_has_no_life_left(self, thickness, rate, minimum):
+    # Generated directly rather than filtered with assume(): thickness <= minimum
+    # holds for ~2.5% of independent draws, which tripped Hypothesis's
+    # filter_too_much health check on some seeds.
+    @given(minimum=minimums, deficit=st.floats(0.0, 1000.0), rate=rates)
+    def test_a_wall_at_or_below_the_minimum_has_no_life_left(self, minimum, deficit, rate):
         """True for *any* rate, including none at all.
 
         Hypothesis found this: the ceiling for a non-corroding wall was
         applied before the exhausted-wall check, so a wall already at its
         minimum reported 50 years where CMLForecaster reported zero.
         """
-        assume(thickness <= minimum)
+        thickness = minimum - deficit
         assert _life(thickness, rate, minimum) == 0.0
 
     @given(thickness=thicknesses, minimum=minimums)
@@ -116,9 +119,11 @@ class TestCorrosionRatioInvariants:
         ratio = float(corrosion_thickness_ratio(pd.Series([rate]), pd.Series([thickness])).iloc[0])
         assert ratio == 0.0
 
-    @given(rate=st.floats(min_value=0.0, max_value=100.0), thickness=thicknesses)
+    # Drawn from the non-positive range itself. Filtering the 0-1000 range with
+    # assume(thickness <= 0) meant 0.0 was the only value ever tested: no
+    # negative reading reached this property.
+    @given(rate=st.floats(min_value=0.0, max_value=100.0), thickness=st.floats(-1000.0, 0.0))
     def test_a_non_positive_wall_yields_zero(self, rate, thickness):
-        assume(thickness <= 0)
         assert (
             float(corrosion_thickness_ratio(pd.Series([rate]), pd.Series([thickness])).iloc[0])
             == 0.0
@@ -130,10 +135,13 @@ class TestRiskInvariants:
     def test_always_returns_a_known_level(self, life, rate, thickness):
         assert risk.classify(life, rate, thickness) in risk.RISK_ORDER
 
-    @given(life=lives, rate=st.floats(0.0, 100.0), thickness=thicknesses)
+    @given(
+        life=lives,
+        rate=st.floats(0.0, 100.0),
+        thickness=st.floats(0.0, risk.CRITICAL_THICKNESS_MM, exclude_max=True),
+    )
     def test_a_thin_wall_is_always_critical(self, life, rate, thickness):
         """Whatever the remaining life says -- the fix from ADR-0005."""
-        assume(thickness < risk.CRITICAL_THICKNESS_MM)
         assert risk.classify(life, rate, thickness) == "CRITICAL"
 
     @given(life=lives, rate=st.floats(0.0, 100.0), thickness=thicknesses)
