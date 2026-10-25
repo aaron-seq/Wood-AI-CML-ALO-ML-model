@@ -173,5 +173,8 @@ jobs:
           test "$(docker exec api id -u)" != "0"
           docker exec api sh -c 'test ! -w /app/app/main.py'
           docker exec api sh -c 'test -w /app/data'
-          docker exec api sh -c 'test ! -e /app/data/sme_overrides.json'
+          # The app creates an empty store on startup, so check the image
+          # itself (before the app runs) and then that the live store is empty.
+          docker run --rm --entrypoint sh wood-cml-api:ci -c 'test ! -e /app/data/sme_overrides.json'
+          docker exec api python -c "import json; assert json.load(open('/app/data/sme_overrides.json')) == []"
           docker rm -f api
