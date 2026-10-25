@@ -47,12 +47,22 @@ carry trailing spaces in headers.
 Use `/upload-cml-data` to inspect a file without scoring it — it returns the
 columns it found plus a full validation report.
 
-## `400 File is too large` / `exceeds the ... row limit`
+## `400 File is too large` / `more than ... rows, the row limit` / `would decompress to`
 
 Defaults are 25 MB and 100,000 rows. Split the file, or raise
 `MAX_UPLOAD_BYTES` / `MAX_UPLOAD_ROWS` — but note uploads are parsed in memory,
 so raising the limit raises the worker's memory ceiling. Size the container to
 match.
+
+The row-limit message says "more than" rather than giving a count: reading
+stops one row past the limit, so an oversized file costs no more to reject
+than one at the limit.
+
+`would decompress to ... MB` applies to `.xlsx` only. A workbook is a zip
+archive, and one may decompress to at most 4 × `MAX_UPLOAD_BYTES` (100 MB by
+default). A legitimate 100,000-row workbook decompresses to about 57 MB. If
+yours is rejected, upload it as CSV, which has no such step and parses about
+70 times faster.
 
 ## `400 The file could not be parsed`
 

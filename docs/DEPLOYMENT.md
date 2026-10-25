@@ -54,8 +54,8 @@ the full list. What actually needs attention in production:
 | `CORS_ORIGINS` | Must name your real dashboard origin over HTTPS. `*` is rejected at startup |
 | `ENVIRONMENT` | Tags logs |
 | `LOG_LEVEL` | `INFO` is right for production; `DEBUG` is noisy |
-| `MAX_UPLOAD_BYTES` | Uploads are parsed in memory — this is the per-request memory ceiling |
-| `MAX_UPLOAD_ROWS` | Second bound, on row count |
+| `MAX_UPLOAD_BYTES` | Uploads are parsed in memory — this is the per-request memory ceiling. An `.xlsx` may also decompress to at most 4× this |
+| `MAX_UPLOAD_ROWS` | Second bound, on row count. Reading stops one row past it |
 | `MODEL_DIR` | Point at a mounted volume to swap models without rebuilding |
 | `CML_API_URL` | Where the dashboard looks for the API |
 
@@ -72,6 +72,11 @@ shaped like the real dataset):
 
 A full 50,000-row scoring request measured **553 ms end to end** through
 the API, including multipart handling and JSON serialisation.
+
+The parse column is CSV. **Excel is roughly 70× slower to parse**: a
+100,000-row `.xlsx` (6.2 MB) took 10 s on the same machine. Parsing runs in a
+worker thread, so it does not stall other requests or the health probe, but it
+does hold a thread for that long. If clients upload large files, prefer CSV.
 
 Two things follow:
 
@@ -102,6 +107,10 @@ Before exposing this to users:
 - [ ] **Set `CORS_ORIGINS`** to your dashboard's real origin.
 - [ ] **Rate-limit** at the gateway. Scoring is synchronous and CPU-bound; an
       unthrottled client can saturate the worker.
+- [ ] **Cap the request body** at the gateway (e.g. nginx
+      `client_max_body_size 26m`). The application reads at most
+      `MAX_UPLOAD_BYTES` of an upload, but the framework has already received
+      and spooled the whole multipart body by then.
 - [ ] **Size memory** from the measured peak above (~41 MiB per in-flight
       100,000-row request) × workers, plus headroom. `MAX_UPLOAD_BYTES` is a
       ceiling on input, not a prediction of memory use.

@@ -115,3 +115,91 @@ class TestParseWithinLimits:
         """An oversized file must not be parsed just to learn it is oversized."""
         with pytest.raises(UploadError, match="too large"):
             parse_within_limits(b"\x00" * 2048, "cml.csv", max_bytes=1024, max_rows=1000)
+
+
+def _xlsx_bytes(df: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False)
+    return buffer.getvalue()
+
+
+class TestParsingWorkIsBounded:
+    """The limits must bound the work done, not just the answer.
+
+    The row limit used to be checked after the whole file had been parsed,
+    so a small, highly compressible workbook declaring far more rows than
+    the limit cost seconds of CPU and memory before it was rejected, with
+    the event loop blocked for all of it.
+    """
+
+    @pytest.mark.parametrize("to_bytes, name", [(_csv_bytes, "big.csv"), (_xlsx_bytes, "big.xlsx")])
+    def test_reading_stops_once_the_row_limit_is_passed(self, to_bytes, name):
+        payload = to_bytes(pd.DataFrame({"a": range(5_000)}))
+        # "more than", not an exact count: an exact count would prove the
+        # whole file was read just to reject it.
+        with pytest.raises(UploadError, match=r"more than 10 rows.*row limit"):
+            parse_within_limits(payload, name, max_bytes=10_000_000, max_rows=10)
+
+    def test_a_file_at_exactly_the_row_limit_is_accepted(self, valid_cml_frame):
+        parsed = parse_within_limits(_csv_bytes(valid_cml_frame), "cml.csv", 10_000_000, 3)
+        assert len(parsed) == 3
+
+    def test_a_workbook_that_inflates_past_the_limit_is_rejected_unparsed(self, monkeypatch):
+        payload = _xlsx_bytes(pd.DataFrame({"a": ["x" * 200] * 2_000}))
+        parsed = []
+        monkeypatch.setattr(pd, "read_excel", lambda *a, **k: parsed.append(1))
+        # 64 KB on the wire; the allowance is four times that, decompressed.
+        with pytest.raises(UploadError, match="decompress"):
+            parse_within_limits(payload, "bomb.xlsx", max_bytes=64 * 1024, max_rows=100_000)
+        assert not parsed, "the workbook was parsed before its inflated size was checked"
+
+    def test_a_corrupt_workbook_is_a_client_error(self):
+        with pytest.raises(UploadError):
+            parse_within_limits(b"PK\x03\x04 not really a zip", "cml.xlsx", 10_000_000, 1000)
+
+
+@pytest.fixture
+def anyio_backend():
+    # AnyIO's pytest plugin ships with AnyIO, which Starlette already
+    # depends on, so async tests need no extra test dependency.
+    return "asyncio"
+
+
+class TestParsingDoesNotBlockTheServer:
+    @pytest.mark.anyio
+    async def test_health_answers_while_an_upload_is_parsed(self, monkeypatch, valid_cml_frame):
+        """A 100,000-row workbook takes ~10 s to parse. Parsed on the event
+        loop, it stalled every other request -- including the health probe
+        an orchestrator uses to decide whether to restart the container."""
+        import asyncio
+        import time
+
+        import httpx2
+
+        import app.ingestion as ingestion
+        from app import main
+
+        real = ingestion.parse_within_limits
+
+        def slow_parse(*args, **kwargs):
+            time.sleep(0.5)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(ingestion, "parse_within_limits", slow_parse)
+        finished: list[str] = []
+        transport = httpx2.ASGITransport(app=main.app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+
+            async def upload():
+                files = {"file": ("cml.csv", _csv_bytes(valid_cml_frame), "text/csv")}
+                await client.post("/upload-cml-data", files=files)
+                finished.append("upload")
+
+            async def health():
+                await asyncio.sleep(0.1)
+                await client.get("/health")
+                finished.append("health")
+
+            await asyncio.gather(upload(), health())
+
+        assert finished == ["health", "upload"]
