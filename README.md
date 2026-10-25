@@ -110,7 +110,7 @@ first 100, as before.
 
 Off by default. Set `API_KEY` (16+ characters) and callers must send
 `X-API-Key`. `API_KEY_SCOPE=writes` (the default) gates only the endpoints
-that mutate the SME audit trail; `all` gates scoring and reporting too. `/`
+that mutate the SME audit trail; `all` gates scoring, reporting and `/metrics` too. `/`
 and `/health` are never gated, so orchestrator probes keep working.
 
 This is a shared secret, not an identity: `sme_name` on an override is still

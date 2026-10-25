@@ -8,6 +8,7 @@ This is the single canonical API entry point. Start it with:
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -48,6 +49,11 @@ logger = logging.getLogger(__name__)
 
 # Fallback for a model whose pickle predates ``feature_names_in_``. The
 # live column list is read off the fitted estimator so it cannot drift.
+# A caller-supplied correlation id is echoed in a header and written to
+# every log line for the request, so it is accepted only when it is short
+# and plain; anything else is replaced rather than trusted.
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
 _FALLBACK_FEATURE_COLUMNS = [
     "average_corrosion_rate",
     "thickness_mm",
@@ -121,7 +127,8 @@ app.add_middleware(
 @app.middleware("http")
 async def observe_request(request: Request, call_next):
     """Tag each request with an id and record its outcome and duration."""
-    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    supplied = request.headers.get("x-request-id", "")
+    request_id = supplied if _REQUEST_ID.match(supplied) else uuid.uuid4().hex[:12]
     request.state.request_id = request_id
 
     started = time.perf_counter()
@@ -132,7 +139,9 @@ async def observe_request(request: Request, call_next):
     # The route template, not request.url.path, so /sme-override/CML-001
     # does not mint a new metric series per CML id.
     route = request.scope.get("route")
-    path = getattr(route, "path", request.url.path)
+    # path_format drops converters ({id_number:path} -> {id_number}), so
+    # adding one to a route does not silently rename its metric series.
+    path = getattr(route, "path_format", None) or getattr(route, "path", request.url.path)
     metrics.observe_request(request.method, path, response.status_code, elapsed)
 
     logger.info(
@@ -227,6 +236,20 @@ def _feature_columns(loaded_model: Any) -> list[str]:
     return list(names) if names is not None else list(_FALLBACK_FEATURE_COLUMNS)
 
 
+def _server_error(request: Request, what: str) -> HTTPException:
+    """A 500 that names the failed step and the request id, and nothing else.
+
+    The underlying exception is logged with its traceback by the caller. It
+    used to be echoed to the client too, which disclosed file system paths
+    and library internals (``[Errno 17] File exists: '/srv/...'``).
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    return HTTPException(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        f"{what} failed. Quote request id {request_id} when reporting this.",
+    )
+
+
 @app.get("/", tags=["meta"])
 async def root() -> dict[str, str]:
     """Service banner with a pointer to the interactive documentation."""
@@ -243,14 +266,21 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok" if model is not None else "degraded",
         "model_loaded": model is not None,
-        "model_path": str(settings.MODEL_PATH) if settings.MODEL_PATH.exists() else None,
+        # File name only: this probe is never gated, and the absolute path
+        # disclosed the server's directory layout to anyone.
+        "model_path": settings.MODEL_PATH.name if settings.MODEL_PATH.exists() else None,
         "version": settings.API_VERSION,
         # Reports whether a key is required, never the key itself.
         "auth": settings.API_KEY_SCOPE if settings.API_KEY else "disabled",
     }
 
 
-@app.get("/metrics", response_class=PlainTextResponse, tags=["meta"])
+@app.get(
+    "/metrics",
+    response_class=PlainTextResponse,
+    tags=["meta"],
+    dependencies=[Depends(require_api_key_for_reads)],
+)
 async def prometheus_metrics() -> PlainTextResponse:
     """Prometheus text-format metrics for this process.
 
@@ -311,11 +341,14 @@ async def upload_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
     dependencies=[Depends(require_api_key_for_reads)],
 )
 async def score_cml_data(
+    request: Request,
     file: UploadFile = File(...),
     offset: int = Query(0, ge=0, description="Index of the first result to return, for paging"),
     limit: int | None = Query(
         None,
         ge=1,
+        # No page can be larger than the largest accepted upload.
+        le=settings.MAX_UPLOAD_ROWS,
         description="Maximum results to return. Defaults to MAX_RESULTS_IN_RESPONSE.",
     ),
 ) -> dict[str, Any]:
@@ -346,9 +379,7 @@ async def score_cml_data(
         predictions, probabilities = _predict(loaded, features[columns])
     except Exception as exc:
         logger.exception("Model inference failed for %s", file.filename)
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Model inference failed: {exc}"
-        ) from exc
+        raise _server_error(request, "Model inference") from exc
 
     # Positional access throughout: ``iterrows`` yields index *labels*,
     # which are only interchangeable with positions for a default
@@ -474,7 +505,7 @@ async def forecast_remaining_life(file: UploadFile = File(...)) -> list[Forecast
     tags=["reporting"],
     dependencies=[Depends(require_api_key_for_reads)],
 )
-async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
+async def generate_report(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
     """Score a file and summarise the results as an elimination report.
 
     Aggregates predictions by commodity and feature type and surfaces the
@@ -500,9 +531,7 @@ async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
         features["elimination_probability"] = probabilities
     except Exception as exc:
         logger.exception("Model inference failed while generating a report")
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Model inference failed: {exc}"
-        ) from exc
+        raise _server_error(request, "Model inference") from exc
 
     features["recommendation"] = features["predicted_elimination"].map({1: "ELIMINATE", 0: "KEEP"})
 
@@ -545,7 +574,7 @@ async def list_sme_overrides() -> dict[str, Any]:
     tags=["sme"],
     dependencies=[Depends(require_api_key)],
 )
-async def create_sme_override(override: SMEOverride) -> dict[str, Any]:
+async def create_sme_override(request: Request, override: SMEOverride) -> dict[str, Any]:
     """Record an expert decision that supersedes the model's recommendation.
 
     Overrides are keyed by CML id: posting the same id again replaces the
@@ -562,16 +591,16 @@ async def create_sme_override(override: SMEOverride) -> dict[str, Any]:
         )
     except OSError as exc:
         logger.exception("Failed to persist SME override for %s", override.id_number)
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Could not persist the override: {exc}"
-        ) from exc
+        raise _server_error(request, "Saving the override") from exc
 
     logger.info("Recorded SME override for %s by %s", override.id_number, override.sme_name)
     return {"override": stored, "message": f"Override recorded for {override.id_number}"}
 
 
 @app.delete(
-    "/sme-override/{id_number}",
+    # :path, because real plant tags contain slashes (10-P-1001/A). Without
+    # it such an override could be recorded but never withdrawn.
+    "/sme-override/{id_number:path}",
     tags=["sme"],
     dependencies=[Depends(require_api_key)],
 )

@@ -5,9 +5,15 @@ the Wood AI CML Optimization API, ensuring type safety and validation.
 """
 
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# C0 and C1 control characters, which include CR, LF and NEL (all treated
+# as line breaks by some log viewers) and the ANSI escape introducer.
+_NO_CONTROL_CHARS = r"^[^\x00-\x1f\x7f-\x9f]*$"
+# The same, but a free-text rationale may span lines.
+_NO_CONTROL_CHARS_EXCEPT_LINE_BREAKS = r"^[^\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]*$"
 
 
 class SMEOverride(BaseModel):
@@ -17,23 +23,47 @@ class SMEOverride(BaseModel):
     including detailed reasoning and metadata.
     """
 
-    id_number: str = Field(..., description="CML identifier being overridden")
+    # These fields reach the server log and the audit trail. Bounds and the
+    # control-character ban stop a single request from growing the store by
+    # megabytes or forging log lines (a newline in sme_name used to produce a
+    # convincing second "Recorded SME override" entry). Surrounding
+    # whitespace is stripped first, so "   " is empty, not three characters.
+    id_number: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        pattern=_NO_CONTROL_CHARS,
+        description="CML identifier being overridden",
+    )
     sme_decision: str = Field(
         ..., pattern="^(KEEP|ELIMINATE)$", description="Expert decision: KEEP or ELIMINATE"
     )
     reason: str = Field(
-        ..., min_length=10, description="Detailed explanation for override decision"
+        ...,
+        min_length=10,
+        max_length=2000,
+        pattern=_NO_CONTROL_CHARS_EXCEPT_LINE_BREAKS,
+        description="Detailed explanation for override decision",
     )
-    sme_name: str = Field(..., description="Name of subject matter expert")
+    sme_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=_NO_CONTROL_CHARS,
+        description="Name of subject matter expert",
+    )
     override_date: datetime | None = Field(
         default_factory=datetime.now, description="Timestamp of override decision"
     )
-    original_prediction: str | None = Field(None, description="Original ML model prediction")
+    original_prediction: Literal["KEEP", "ELIMINATE"] | None = Field(
+        None, description="Original ML model prediction"
+    )
     original_probability: float | None = Field(
         None, ge=0.0, le=1.0, description="Original prediction probability"
     )
 
     model_config = ConfigDict(
+        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "id_number": "CML-042",
@@ -43,7 +73,7 @@ class SMEOverride(BaseModel):
                 "original_prediction": "ELIMINATE",
                 "original_probability": 0.85,
             }
-        }
+        },
     )
 
 
@@ -74,7 +104,10 @@ class HealthResponse(BaseModel):
 
     status: str = Field(..., description="API operational status: ok or degraded")
     model_loaded: bool = Field(..., description="Whether ML model is loaded")
-    model_path: str | None = Field(None, description="Path to model file")
+    model_path: str | None = Field(
+        None,
+        description="File name of the model artifact, if present. The directory is not disclosed.",
+    )
     version: str = Field(..., description="API version")
     auth: str = Field(
         "disabled",

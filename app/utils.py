@@ -419,3 +419,31 @@ def generate_elimination_report(predictions_df: pd.DataFrame) -> dict[str, Any]:
             report["marginal_cases"] = marginal_cases[available_marginal_cols].to_dict("records")
 
     return report
+
+
+# A text cell beginning with one of these is evaluated as a formula by Excel,
+# LibreOffice and Google Sheets (OWASP "CSV injection").
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def neutralise_spreadsheet_formulas(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy safe to export as CSV for opening in a spreadsheet.
+
+    Exports carry values from uploaded files, so a cell such as
+    ``=HYPERLINK(...)`` would otherwise execute when an engineer opens the
+    download. Text cells starting a formula are prefixed with ``'``, which
+    spreadsheets treat as "display as text". Numeric columns are left alone,
+    so negative numbers such as ``-417`` days are not mangled.
+    """
+    safe = frame.copy()
+    for column in safe.columns:
+        if pd.api.types.is_numeric_dtype(safe[column]) or pd.api.types.is_bool_dtype(safe[column]):
+            continue
+        safe[column] = safe[column].map(
+            lambda value: (
+                "'" + value
+                if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS)
+                else value
+            )
+        )
+    return safe

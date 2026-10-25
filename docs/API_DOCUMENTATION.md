@@ -12,10 +12,12 @@ historical behaviour. Set it (16+ characters) and callers must send
 | `API_KEY_SCOPE` | Gated |
 | --- | --- |
 | `writes` (default) | `POST`/`DELETE /sme-override` |
-| `all` | Everything except `/` and `/health` |
+| `all` | Every endpoint except `/` and `/health`, including `/metrics` |
 
 `/` and `/health` are never gated — an orchestrator cannot attach
-credentials to a liveness probe. `GET /health` reports the active posture
+credentials to a liveness probe. The interactive docs (`/docs`, `/redoc`,
+`/openapi.json`) are not gated either: they describe the API, which is
+generated from code that is already public, and expose no data. `GET /health` reports the active posture
 as `"auth": "disabled" | "writes" | "all"`, never the key itself.
 
 A rejected request returns `401` with `WWW-Authenticate: X-API-Key`.
@@ -29,7 +31,12 @@ identity still requires real authentication upstream.
 ## Conventions
 
 Every response carries an `x-request-id` header. Supply your own to correlate a
-client-side report with server logs; otherwise one is generated.
+client-side report with server logs; otherwise one is generated. A supplied id
+is kept only if it is 1–64 characters of `A-Z a-z 0-9 . _ -`, because it is
+written to every log line for the request; anything else is replaced.
+
+A `500` names the step that failed and the request id, never the underlying
+exception — that is in the server log, against the same id.
 
 | Status | Meaning |
 | --- | --- |
@@ -67,7 +74,7 @@ Liveness and readiness. Used by the Docker healthcheck and the dashboard.
 {
   "status": "ok",
   "model_loaded": true,
-  "model_path": "/app/models/cml_elimination_model.joblib",
+  "model_path": "cml_elimination_model.joblib",
   "version": "1.0.0"
 }
 ```
@@ -207,7 +214,7 @@ curl -X POST http://localhost:8000/score-cml-data -F "file=@data/cml_sample_500.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `offset` | `0` | Index of the first result to return |
-| `limit` | `MAX_RESULTS_IN_RESPONSE` (100) | Maximum results in this page |
+| `limit` | `MAX_RESULTS_IN_RESPONSE` (100) | Maximum results in this page, at most `MAX_UPLOAD_ROWS` |
 
 Every row is always scored; these page over the response body only.
 Omitting both reproduces the previous behaviour exactly.
@@ -326,12 +333,16 @@ curl -X POST http://localhost:8000/sme-override \
 
 | Field | Required | Constraint |
 | --- | --- | --- |
-| `id_number` | yes | — |
+| `id_number` | yes | 1–64 characters, no control characters |
 | `sme_decision` | yes | `KEEP` or `ELIMINATE` |
-| `reason` | yes | At least 10 characters |
-| `sme_name` | yes | — |
-| `original_prediction` | no | Feeds the agreement rate |
+| `reason` | yes | 10–2,000 characters; may span lines, no other control characters |
+| `sme_name` | yes | 1–128 characters, no control characters |
+| `original_prediction` | no | `KEEP` or `ELIMINATE`; feeds the agreement rate |
 | `original_probability` | no | `[0, 1]` |
+
+Leading and trailing whitespace is stripped before the limits apply, so a
+reason of ten spaces is empty. These fields are written to the server log, which
+is why control characters (including newlines, outside `reason`) are refused.
 
 Posting the same `id_number` again **replaces** the previous decision. A
 violated constraint returns `422`.
@@ -369,7 +380,9 @@ model's field credibility and is worth watching over time.
 
 ### `DELETE /sme-override/{id_number}`
 
-`200` on removal, `404` if there was nothing to remove.
+`200` on removal, `404` if there was nothing to remove. Identifiers containing
+`/` (plant tags such as `10-P-1001/A`) are passed as-is:
+`DELETE /sme-override/10-P-1001/A`.
 
 ---
 
