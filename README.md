@@ -72,6 +72,28 @@ them:
 
 ---
 
+## Configuration
+
+Every setting is an environment variable (or a line in `.env`), read once at
+startup. [`.env.example`](.env.example) lists them all with their defaults;
+copy it to `.env` to change one. The ones most deployments touch:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | Where the API listens, in or out of a container |
+| `API_KEY` / `API_KEY_SCOPE` | unset / `writes` | Optional shared-secret auth — see [Authentication](#authentication) |
+| `CORS_ORIGINS` | `http://localhost:8501` | Dashboard origin; `*` is refused |
+| `MODEL_DIR` / `MODEL_FILENAME` | `models` / `cml_elimination_model.joblib` | Which artifact to serve |
+| `MAX_UPLOAD_BYTES` / `MAX_UPLOAD_ROWS` | 25 MB / 100,000 | Upload bounds |
+| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | `json` for log shippers |
+| `METRICS_ENABLED` | `false` | Expose `/metrics` |
+| `CML_API_URL` | `http://localhost:8000` | Where the dashboard finds the API |
+
+Production guidance for each is in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#configuration).
+
+---
+
 ## API
 
 Full reference with request and response bodies:

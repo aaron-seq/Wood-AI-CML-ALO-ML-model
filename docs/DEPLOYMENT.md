@@ -13,9 +13,36 @@ Brings up `wood-cml-api` on 8000 and `wood-cml-dashboard` on 8501. The
 dashboard waits for the API's healthcheck, so it never starts against an API
 that has not loaded its model.
 
+Both ports are published on **127.0.0.1 only**. Authentication is off by
+default, so publishing on every interface would put an unauthenticated API on
+the network. To serve other hosts, set `API_KEY` first, then change the
+mappings in `docker-compose.yml` to `"8000:8000"` and `"8501:8501"` — or,
+better, keep them on loopback and put the authenticating gateway from the
+[production checklist](#production-checklist) in front.
+
+### Upgrading an existing deployment: remove a shipped test override
+
+Images built before this was fixed shipped a test override record that
+retires **CML-209** (decision `ELIMINATE`, reason `Eliminate`, dated
+2025-12-07). A compose volume is seeded from the image the first time it is
+created, so a volume made from such an image still holds it. Check, and remove
+it through the API so the removal is logged:
+
+```bash
+curl -s localhost:8000/sme-override | grep -A3 '"CML-209"'
+curl -X DELETE localhost:8000/sme-override/CML-209   # add -H "X-API-Key: ..." if set
+```
+
+Only delete it if the record matches the one above: if an engineer has since
+recorded their own decision for CML-209, it replaced the test record and must
+be kept.
+
 Properties worth knowing:
 
-- The image runs as uid 10001, not root. CI asserts this.
+- The image runs as uid 10001, not root, and that user cannot modify the
+  application code — only `data/` is writable. CI asserts both.
+- `HOST` and `PORT` from the environment are honoured, as outside a container
+  (defaults `0.0.0.0` and `8000`); the healthcheck follows `PORT`.
 - The build toolchain stays in the builder stage; the runtime image ships only
   the virtualenv.
 - `HEALTHCHECK` polls `/health` every 30s after a 20s grace period.
