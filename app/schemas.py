@@ -293,7 +293,7 @@ class ModelInfoResponse(BaseModel):
     features_used: list[str] = Field(
         ..., description="Feature columns the estimator consumes, in fitted order"
     )
-    model_path: str = Field(..., description="Filesystem path of the loaded artifact")
+    model_path: str = Field(..., description="File name of the loaded artifact")
 
 
 class ReportResponse(BaseModel):

@@ -57,7 +57,14 @@ logger = logging.getLogger(__name__)
 # A caller-supplied correlation id is echoed in a header and written to
 # every log line for the request, so it is accepted only when it is short
 # and plain; anything else is replaced rather than trusted.
-_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _request_id_from(supplied: str) -> str:
+    """The caller's id if it is plain enough to log, else a fresh one."""
+    # fullmatch, not match with $: $ also matches before a trailing newline.
+    return supplied if _REQUEST_ID.fullmatch(supplied) else uuid.uuid4().hex[:12]
+
 
 _FALLBACK_FEATURE_COLUMNS = [
     "average_corrosion_rate",
@@ -132,8 +139,7 @@ app.add_middleware(
 @app.middleware("http")
 async def observe_request(request: Request, call_next):
     """Tag each request with an id and record its outcome and duration."""
-    supplied = request.headers.get("x-request-id", "")
-    request_id = supplied if _REQUEST_ID.match(supplied) else uuid.uuid4().hex[:12]
+    request_id = _request_id_from(request.headers.get("x-request-id", ""))
     request.state.request_id = request_id
 
     started = time.perf_counter()
@@ -404,7 +410,9 @@ async def model_info() -> dict[str, Any]:
     return {
         "model_type": type(loaded).__name__,
         "features_used": _feature_columns(loaded),
-        "model_path": str(settings.MODEL_PATH),
+        # The file name identifies the artifact; the directory is the
+        # operator's own configuration (MODEL_DIR) and not the caller's business.
+        "model_path": settings.MODEL_PATH.name,
     }
 
 

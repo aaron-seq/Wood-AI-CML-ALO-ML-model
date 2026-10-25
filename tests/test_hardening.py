@@ -174,3 +174,80 @@ class TestNonFiniteJsonIsAClientError:
         )
         assert response.status_code == 422
         assert response.json()["detail"][0]["loc"][-1] == "original_probability"
+
+
+class TestTextLogsCannotBeForged:
+    """Values from requests -- an upload's filename, ids inside the file --
+    reach log messages. In the default text format a newline in one forged
+    a convincing second log line. JSON output was already safe."""
+
+    @pytest.mark.parametrize("separator", ["\n", "\r", "\x1b[2J", " ", " ", "\x85"])
+    def test_control_and_line_separators_are_escaped(self, separator):
+        import logging
+
+        from app.observability import TextFormatter
+
+        record = logging.LogRecord(
+            "app.main",
+            logging.INFO,
+            __file__,
+            1,
+            "Parsed upload %s",
+            (f"x{separator}FORGED",),
+            None,
+        )
+        line = TextFormatter("%(message)s").format(record)
+        assert separator not in line
+        assert "FORGED" in line  # escaped, not dropped
+
+    def test_tracebacks_keep_their_lines(self):
+        import logging
+        import sys
+
+        from app.observability import TextFormatter
+
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord("app", logging.ERROR, __file__, 1, "failed", (), exc_info)
+        assert "\nRuntimeError: boom" in TextFormatter("%(message)s").format(record)
+
+    def test_the_default_format_uses_it(self, monkeypatch):
+        import logging
+
+        from app.observability import TextFormatter, configure_logging
+
+        monkeypatch.setattr(main.settings, "LOG_FORMAT", "text")
+        configure_logging()
+        assert all(isinstance(h.formatter, TextFormatter) for h in logging.getLogger().handlers)
+
+
+class TestOddCredentialsAreRejectedNot500:
+    def test_a_non_ascii_key_is_a_401(self, client, monkeypatch):
+        """compare_digest raises TypeError on non-ASCII str."""
+        monkeypatch.setattr(main.settings, "API_KEY", KEY)
+        response = client.post(
+            "/sme-override", json=VALID_OVERRIDE, headers={"X-API-Key": b"\xe9" * 24}
+        )
+        assert response.status_code == 401
+
+
+class TestRemainingDisclosuresAndLimits:
+    def test_model_info_reports_the_file_name_not_the_install_path(self, client):
+        assert "/" not in client.get("/model/info").json()["model_path"]
+
+    def test_a_trailing_newline_does_not_sneak_into_the_request_id(self):
+        """re.match with $ accepts a trailing newline. Unreachable over HTTP,
+        where servers strip it, but reachable from any raw ASGI caller."""
+        assert main._request_id_from("abc\n") != "abc\n"
+        assert main._request_id_from("abc") == "abc"
+
+    def test_the_dashboard_upload_cap_is_no_larger_than_the_apis(self):
+        import tomllib
+        from pathlib import Path
+
+        config = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / ".streamlit/config.toml").read_text()
+        )
+        assert config["server"]["maxUploadSize"] <= main.settings.MAX_UPLOAD_BYTES // (1024 * 1024)
