@@ -34,8 +34,21 @@ Forecasting keeps working without a model; only scoring and reporting need one.
 
 ## `400 Unsupported file format`
 
-Only `.csv`, `.xlsx` and `.xls` are accepted, matched on the filename
-extension. A CSV named `export` with no extension is rejected — rename it.
+Only `.csv` and `.xlsx` are accepted, matched on the filename extension. A CSV
+named `export` with no extension is rejected — rename it. Save legacy `.xls`
+workbooks as `.xlsx` or CSV.
+
+## `400 ... columns; at most 256 are accepted` / `shared strings table`
+
+A row is wider than any real CML export, which usually means the wrong
+delimiter or a corrupt file. The shared-strings message applies to `.xlsx`
+only: the workbook carries an unusually large text table. Either way, export
+the sheet as CSV.
+
+## `400 The file is not a valid .xlsx workbook`
+
+The file is named `.xlsx` but is something else — a renamed `.ods`, `.xlsb`
+or `.xls`, or a damaged download. Re-save it from the spreadsheet as `.xlsx`.
 
 ## `400 Missing required columns: ...`
 

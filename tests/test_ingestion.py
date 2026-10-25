@@ -203,3 +203,120 @@ class TestParsingDoesNotBlockTheServer:
             await asyncio.gather(upload(), health())
 
         assert finished == ["health", "upload"]
+
+
+def _zip(members: dict[str, bytes | str]) -> bytes:
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    return buffer.getvalue()
+
+
+class TestWidthAndMemberBounds:
+    """Found by adversarial review of the row bound: rows were capped, but
+    columns and individual archive members were not."""
+
+    def test_a_csv_wider_than_the_column_limit_is_rejected_before_parsing(self, monkeypatch):
+        """An 889 KB CSV with 100,000 columns was accepted at +120 MB RSS."""
+        from app import ingestion
+
+        header = ",".join(f"c{i}" for i in range(ingestion.MAX_COLUMNS + 1))
+        parsed = []
+        monkeypatch.setattr(pd, "read_csv", lambda *a, **k: parsed.append(1))
+        with pytest.raises(UploadError, match="columns"):
+            parse_within_limits(f"{header}\n".encode(), "w.csv", 10_000_000, 1000)
+        assert not parsed
+
+    def test_a_data_row_wider_than_the_column_limit_is_rejected_before_parsing(self, monkeypatch):
+        """Found while retesting the header check: a 4 MB CSV with a normal
+        12-column header and one 2,000,000-field row was *accepted* after
+        187 s and +3.8 GB, because pandas turns surplus fields into index
+        levels. Width must be bounded on every row read, not the header."""
+        from app import ingestion
+
+        row = ",".join("1" for _ in range(ingestion.MAX_COLUMNS + 1))
+        parsed = []
+        monkeypatch.setattr(pd, "read_csv", lambda *a, **k: parsed.append(1))
+        with pytest.raises(UploadError, match="columns"):
+            parse_within_limits(f"a,b,c\n1,2,3\n{row}\n".encode(), "w.csv", 10_000_000, 1000)
+        assert not parsed
+
+    def test_only_the_rows_that_would_be_read_are_scanned(self):
+        """Rows past the row limit are never parsed, so they need no scan."""
+        from app import ingestion
+
+        wide = ",".join("1" for _ in range(ingestion.MAX_COLUMNS + 1))
+        payload = ("a,b\n" + "1,2\n" * 5 + wide + "\n").encode()
+        with pytest.raises(UploadError, match="more than 3 rows"):
+            parse_within_limits(payload, "w.csv", 10_000_000, 3)
+
+    def test_a_csv_at_the_column_limit_is_accepted(self):
+        from app import ingestion
+
+        names = [f"c{i}" for i in range(ingestion.MAX_COLUMNS)]
+        payload = (",".join(names) + "\n" + ",".join("1" for _ in names) + "\n").encode()
+        assert parse_within_limits(payload, "w.csv", 10_000_000, 1000).shape == (1, len(names))
+
+    def test_a_workbook_wider_than_the_column_limit_is_rejected(self):
+        from app import ingestion
+
+        frame = pd.DataFrame([range(ingestion.MAX_COLUMNS + 1)])
+        with pytest.raises(UploadError, match="columns"):
+            parse_within_limits(_xlsx_bytes(frame), "w.xlsx", 10_000_000, 1000)
+
+    def test_an_oversized_shared_strings_part_is_rejected_unparsed(self, monkeypatch):
+        """Shared strings are parsed in full when a workbook opens, about 20x
+        more expensively per byte than sheet XML. A 129 KB workbook whose
+        table fit inside the whole-archive allowance cost 20 s and 233 MB."""
+        from app import ingestion
+
+        table = (
+            b"<sst>" + b"<si><t>y</t></si>" * (ingestion.MAX_SHARED_STRINGS_BYTES // 16) + b"</sst>"
+        )
+        payload = _zip({"xl/workbook.xml": "<workbook/>", "xl/sharedStrings.xml": table})
+        parsed = []
+        monkeypatch.setattr(pd, "read_excel", lambda *a, **k: parsed.append(1))
+        with pytest.raises(UploadError, match="shared strings"):
+            parse_within_limits(payload, "s.xlsx", 25 << 20, 1000)
+        assert not parsed
+
+    def test_an_archive_with_too_many_members_is_rejected(self):
+        from app import ingestion
+
+        members = {f"xl/m{i}.xml": "" for i in range(ingestion.MAX_ARCHIVE_MEMBERS + 1)}
+        with pytest.raises(UploadError, match="parts"):
+            parse_within_limits(_zip(members), "m.xlsx", 25 << 20, 1000)
+
+
+class TestMalformedWorkbooksAreClientErrors:
+    """Each of these zip files named .xlsx used to escape as a 500."""
+
+    @pytest.mark.parametrize(
+        "members",
+        [
+            pytest.param({"hello.txt": "hi"}, id="no-workbook"),
+            pytest.param(
+                {"[Content_Types].xml": "<not xml", "xl/workbook.xml": "<<<"}, id="bad-xml"
+            ),
+            pytest.param(
+                {
+                    "mimetype": "application/vnd.oasis.opendocument.spreadsheet",
+                    "content.xml": "<x/>",
+                },
+                id="ods-renamed",
+            ),
+            pytest.param({"[Content_Types].xml": "<Types/>", "xl/workbook.bin": "\x00"}, id="xlsb"),
+        ],
+    )
+    def test_is_a_400(self, members):
+        with pytest.raises(UploadError):
+            parse_within_limits(_zip(members), "m.xlsx", 25 << 20, 1000)
+
+    def test_legacy_xls_is_refused_up_front(self):
+        """.xls was on the allow-list, but no .xls reader is installed, so
+        every .xls upload failed after the fact."""
+        with pytest.raises(UploadError, match="Unsupported file format"):
+            parse_bytes(b"\xd0\xcf\x11\xe0", "old.xls")

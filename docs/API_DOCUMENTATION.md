@@ -51,8 +51,11 @@ exception — that is in the server log, against the same id.
 Errors return `{"detail": "...", "request_id": "..."}`. A `400` always names
 what to fix.
 
-Upload endpoints accept `.csv`, `.xlsx` and `.xls` as `multipart/form-data`
-under the field name `file`. Defaults: 25 MB and 100,000 rows.
+Upload endpoints accept `.csv` and `.xlsx` as `multipart/form-data` under
+the field name `file`. Defaults: 25 MB and 100,000 rows. Every row may have at
+most 256 columns (the schema has twelve). An `.xlsx` may decompress to at most
+4 × the byte limit, with a shared-strings table of at most 16 MB. Legacy `.xls`
+is not accepted: no reader for it is installed, so it never worked.
 
 ---
 

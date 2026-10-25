@@ -93,5 +93,5 @@ disallow_untyped_defs = false
 # explicitly means a *new* untyped import is reported rather than silently
 # absorbed by a blanket ignore_missing_imports = true.
 [[tool.mypy.overrides]]
-module = ["joblib.*", "plotly.*", "sklearn.*"]
+module = ["joblib.*", "openpyxl.*", "plotly.*", "sklearn.*"]
 ignore_missing_imports = true
