@@ -84,6 +84,7 @@ Full reference with request and response bodies:
 | `GET` | `/metrics` | Prometheus metrics (404 unless enabled) |
 | `POST` | `/upload-cml-data` | Parse and validate a file without scoring it |
 | `POST` | `/score-cml-data` | Score every CML, applying any expert overrides |
+| `POST` | `/predict` | Score one CML sent as JSON, same pipeline as a batch |
 | `POST` | `/forecast-remaining-life` | Remaining life and next inspection date |
 | `POST` | `/generate-report` | Aggregated elimination analysis |
 | `GET` | `/sme-override` | List overrides and agreement statistics |

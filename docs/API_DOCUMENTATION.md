@@ -230,6 +230,43 @@ incomplete file), `401` (auth enabled, key missing), `503` (no model),
 
 ---
 
+## `POST /predict`
+
+Scores one CML sent as JSON — no file needed. It runs the same pipeline as
+`/score-cml-data` (features, model, SME overrides), so a CML gets the same
+answer here as inside a batch; a test asserts exactly that.
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"id_number": "CML-042", "average_corrosion_rate": 0.12, "thickness_mm": 9.5,
+       "commodity": "Crude Oil", "feature_type": "Pipe", "cml_shape": "Internal"}'
+```
+
+```json
+{
+  "id_number": "CML-042",
+  "predicted_elimination_flag": 0,
+  "elimination_probability": 0.028189334573614028,
+  "model_recommendation": "KEEP",
+  "recommendation": "KEEP",
+  "confidence": "HIGH",
+  "sme_override": null,
+  "warnings": []
+}
+```
+
+The body takes the columns an upload does. The six required ones must be
+present; `risk_score`, `minimum_thickness_mm`, `remaining_life_years` and
+`last_inspection_date` (`YYYY-MM-DD`) are optional and derived or defaulted
+when omitted, exactly as for a file. Unknown fields are rejected rather than
+ignored, so a misspelt optional field cannot silently fall back to its default.
+
+Out-of-range values (a 900 mm wall, a negative corrosion rate) are scored and
+reported in `warnings`, as an upload reports them. Wrong types, missing
+fields, `Infinity`/`NaN` and over-long strings return `422`. `503` if no
+model is loaded. Gated like the other reads when `API_KEY_SCOPE=all`.
+
 ## `POST /forecast-remaining-life`
 
 Projects remaining life and a next-inspection date per CML using the API 570

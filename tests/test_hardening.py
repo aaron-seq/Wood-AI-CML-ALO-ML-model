@@ -158,3 +158,19 @@ class TestSpreadsheetFormulaNeutralising:
         frame = pd.DataFrame({"id_number": ["=1"]})
         neutralise_spreadsheet_formulas(frame)
         assert frame.loc[0, "id_number"] == "=1"
+
+
+class TestNonFiniteJsonIsAClientError:
+    """Python's JSON parser accepts Infinity and NaN. Pydantic rejected them,
+    but FastAPI's default 422 handler echoed the input back and could not
+    serialise it, so any float field turned a bad request into a 500."""
+
+    def test_on_an_existing_route(self, client):
+        import json
+
+        body = json.dumps({**VALID_OVERRIDE, "original_probability": float("inf")})
+        response = client.post(
+            "/sme-override", content=body, headers={"content-type": "application/json"}
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"][-1] == "original_probability"

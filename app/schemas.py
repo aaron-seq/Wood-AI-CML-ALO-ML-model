@@ -172,6 +172,57 @@ class PredictionResult(BaseModel):
     )
 
 
+class CMLRecord(BaseModel):
+    """One CML, for scoring over JSON with ``POST /predict``.
+
+    The same columns an upload carries. Pydantic checks only what JSON
+    introduces -- types, unknown fields, non-finite numbers, string bounds.
+    Range checks stay in :func:`app.utils.validate_cml_dataframe`, shared
+    with uploads, and surface as ``warnings`` exactly as they do there.
+    """
+
+    # forbid: a misspelt optional field ("minimum_thickness") would
+    # otherwise be dropped silently and the default used in its place.
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+        allow_inf_nan=False,
+        json_schema_extra={
+            "example": {
+                "id_number": "CML-042",
+                "average_corrosion_rate": 0.12,
+                "thickness_mm": 9.5,
+                "commodity": "Crude Oil",
+                "feature_type": "Pipe",
+                "cml_shape": "Internal",
+            }
+        },
+    )
+
+    id_number: str = Field(..., min_length=1, max_length=64, pattern=_NO_CONTROL_CHARS)
+    average_corrosion_rate: float = Field(..., description="Corrosion rate, mm/year")
+    thickness_mm: float = Field(..., description="Current wall thickness, mm")
+    commodity: str = Field(..., min_length=1, max_length=64, pattern=_NO_CONTROL_CHARS)
+    feature_type: str = Field(..., min_length=1, max_length=64, pattern=_NO_CONTROL_CHARS)
+    cml_shape: str = Field(..., min_length=1, max_length=64, pattern=_NO_CONTROL_CHARS)
+    risk_score: float | None = Field(None, description="Derived when omitted")
+    minimum_thickness_mm: float | None = Field(
+        None, description="Retirement thickness; the global default when omitted"
+    )
+    remaining_life_years: float | None = Field(None, description="Derived when omitted")
+    last_inspection_date: date | None = Field(
+        None, description="Inspection age defaults to 365 days when omitted"
+    )
+
+
+class PredictResponse(PredictionResult):
+    """The batch result for one CML, plus the validator's warnings."""
+
+    warnings: list[str] = Field(
+        default_factory=list, description="Out-of-range values, as an upload would report"
+    )
+
+
 class ScoreResponse(BaseModel):
     """Response from the CML scoring endpoint.
 
