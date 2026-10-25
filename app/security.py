@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from typing import NoReturn
 
 from fastapi import Header, HTTPException, Request, status
 
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 API_KEY_HEADER = "X-API-Key"
 
 
-def _reject(request: Request, reason: str) -> None:
+def _reject(request: Request, reason: str) -> NoReturn:
     """Log the rejection with correlation, then fail the request.
 
     The response body never says *why* the key was wrong -- missing and
@@ -44,14 +45,17 @@ def _reject(request: Request, reason: str) -> None:
 
 
 def _check(request: Request, supplied: str | None) -> None:
-    if settings.API_KEY is None:
+    expected = settings.API_KEY
+    if expected is None:
         return
     if supplied is None:
         _reject(request, f"no {API_KEY_HEADER} header supplied")
     # compare_digest rather than ==: a plain comparison returns as soon as
     # it finds a differing byte, which leaks the key one byte at a time to
     # anyone who can time the response.
-    if not secrets.compare_digest(supplied or "", settings.API_KEY):
+    # Bytes, because compare_digest raises TypeError on a non-ASCII str:
+    # a header of "é" characters turned a rejection into a 500.
+    if not secrets.compare_digest(supplied.encode(), expected.encode()):
         _reject(request, f"incorrect {API_KEY_HEADER} value")
 
 

@@ -1,7 +1,9 @@
 .git
 .github
 .gitignore
-.venv
+.venv*
+# Each deployment owns its override audit trail; never ship one.
+data/sme_overrides.json
 venv
 env
 __pycache__

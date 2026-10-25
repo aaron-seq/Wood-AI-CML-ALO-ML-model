@@ -186,29 +186,26 @@ class SMEOverrideManager:
             return predictions_df
 
         override_dict = {ov["id_number"]: ov for ov in overrides}
+        matched = predictions_df["id_number"].map(override_dict.get)
+        has_override = matched.notna()
 
-        predictions_df["has_sme_override"] = False
-        predictions_df["sme_decision"] = None
-        predictions_df["sme_reason"] = None
-        predictions_df["sme_name"] = None
-        predictions_df["sme_override_date"] = None
+        def field(key: str) -> pd.Series:
+            return matched.map(lambda ov: ov[key] if isinstance(ov, dict) else None)
 
-        for idx, row in predictions_df.iterrows():
-            cml_id = row["id_number"]
+        predictions_df["has_sme_override"] = has_override
+        predictions_df["sme_decision"] = field("sme_decision")
+        predictions_df["sme_reason"] = field("reason")
+        predictions_df["sme_name"] = field("sme_name")
+        predictions_df["sme_override_date"] = field("override_date")
 
-            if cml_id in override_dict:
-                override = override_dict[cml_id]
-
-                predictions_df.at[idx, "has_sme_override"] = True
-                predictions_df.at[idx, "sme_decision"] = override["sme_decision"]
-                predictions_df.at[idx, "sme_reason"] = override["reason"]
-                predictions_df.at[idx, "sme_name"] = override["sme_name"]
-                predictions_df.at[idx, "sme_override_date"] = override["override_date"]
-
-                if "recommendation" in predictions_df.columns:
-                    predictions_df.at[idx, "final_decision"] = override["sme_decision"]
-                else:
-                    predictions_df.at[idx, "recommendation"] = override["sme_decision"]
+        # Null for rows nobody overruled: callers use notna() on this column
+        # to find the overruled rows. Written whole-column rather than per
+        # row with .at, which pandas 3 deprecated for a column that does not
+        # yet exist and pandas 4 turns into a KeyError.
+        target = (
+            "final_decision" if "recommendation" in predictions_df.columns else "recommendation"
+        )
+        predictions_df[target] = predictions_df["sme_decision"]
 
         return predictions_df
 

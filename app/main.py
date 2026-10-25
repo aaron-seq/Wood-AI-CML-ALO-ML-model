@@ -8,6 +8,8 @@ This is the single canonical API entry point. Start it with:
 from __future__ import annotations
 
 import logging
+import math
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -17,6 +19,8 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
@@ -25,9 +29,11 @@ from app.features import engineer_features, resolve_minimum_thickness
 from app.ingestion import UploadError, read_upload
 from app.observability import configure_logging, metrics
 from app.schemas import (
+    CMLRecord,
     ForecastOutput,
     HealthResponse,
     ModelInfoResponse,
+    PredictResponse,
     ReportResponse,
     ScoreResponse,
     SMEOverride,
@@ -48,6 +54,18 @@ logger = logging.getLogger(__name__)
 
 # Fallback for a model whose pickle predates ``feature_names_in_``. The
 # live column list is read off the fitted estimator so it cannot drift.
+# A caller-supplied correlation id is echoed in a header and written to
+# every log line for the request, so it is accepted only when it is short
+# and plain; anything else is replaced rather than trusted.
+_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _request_id_from(supplied: str) -> str:
+    """The caller's id if it is plain enough to log, else a fresh one."""
+    # fullmatch, not match with $: $ also matches before a trailing newline.
+    return supplied if _REQUEST_ID.fullmatch(supplied) else uuid.uuid4().hex[:12]
+
+
 _FALLBACK_FEATURE_COLUMNS = [
     "average_corrosion_rate",
     "thickness_mm",
@@ -121,7 +139,7 @@ app.add_middleware(
 @app.middleware("http")
 async def observe_request(request: Request, call_next):
     """Tag each request with an id and record its outcome and duration."""
-    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    request_id = _request_id_from(request.headers.get("x-request-id", ""))
     request.state.request_id = request_id
 
     started = time.perf_counter()
@@ -132,7 +150,9 @@ async def observe_request(request: Request, call_next):
     # The route template, not request.url.path, so /sme-override/CML-001
     # does not mint a new metric series per CML id.
     route = request.scope.get("route")
-    path = getattr(route, "path", request.url.path)
+    # path_format drops converters ({id_number:path} -> {id_number}), so
+    # adding one to a route does not silently rename its metric series.
+    path = str(getattr(route, "path_format", None) or getattr(route, "path", request.url.path))
     metrics.observe_request(request.method, path, response.status_code, elapsed)
 
     logger.info(
@@ -150,6 +170,31 @@ async def observe_request(request: Request, call_next):
         },
     )
     return response
+
+
+def _finite(value: Any) -> Any:
+    """Make a validation error report strict-JSON safe."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _finite(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_finite(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's own 422 shape, but safe for non-finite input.
+
+    Python's JSON parser accepts ``Infinity`` and ``NaN``. Pydantic rejects
+    them, but the default handler echoes the offending input back and cannot
+    serialise it, so any float field turned a bad request into a 500.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"detail": _finite(jsonable_encoder(exc.errors()))},
+    )
 
 
 @app.exception_handler(UploadError)
@@ -227,6 +272,109 @@ def _feature_columns(loaded_model: Any) -> list[str]:
     return list(names) if names is not None else list(_FALLBACK_FEATURE_COLUMNS)
 
 
+def _server_error(request: Request, what: str) -> HTTPException:
+    """A 500 that names the failed step and the request id, and nothing else.
+
+    The underlying exception is logged with its traceback by the caller. It
+    used to be echoed to the client too, which disclosed file system paths
+    and library internals (``[Errno 17] File exists: '/srv/...'``).
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    return HTTPException(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        f"{what} failed. Quote request id {request_id} when reporting this.",
+    )
+
+
+# Text columns whose surrounding whitespace is a data-entry artefact, not
+# meaning: " Crude Oil" was an unseen category to the model, and a padded id
+# never matched its override (override ids are stripped on entry).
+_TEXT_COLUMNS = ("id_number", "commodity", "feature_type", "cml_shape")
+
+
+def _normalise_text(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip surrounding whitespace from identifier and category columns.
+
+    Done here, on the one scoring path, so an upload and ``/predict`` treat
+    the same values identically.
+    """
+    df = df.copy()
+    for column in _TEXT_COLUMNS:
+        if column in df.columns:
+            df[column] = df[column].map(lambda v: v.strip() if isinstance(v, str) else v)
+    return df
+
+
+def _score(
+    request: Request, loaded: Any, df: pd.DataFrame, *, source: str | None
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    """Validate, engineer features, predict and apply SME overrides.
+
+    The one scoring path. ``/score-cml-data`` and ``/predict`` both call it,
+    so a CML scored on its own cannot get a different answer from the same
+    CML inside a batch.
+
+    Returns:
+        The per-CML results, the feature columns used, and the validator's
+        report (whose ``warnings`` callers may surface).
+
+    Raises:
+        UploadError: If the records fail validation or lack model features.
+        HTTPException: 500 if inference fails.
+    """
+    df = _normalise_text(df)
+    validation = validate_cml_dataframe(df)
+    if not validation["valid"]:
+        raise UploadError("; ".join(validation["errors"]))
+
+    features = engineer_features(df, minimum_thickness_mm=settings.DEFAULT_MINIMUM_THICKNESS)
+
+    columns = _feature_columns(loaded)
+    missing = [column for column in columns if column not in features.columns]
+    if missing:
+        raise UploadError(f"Missing columns required by the model: {', '.join(missing)}")
+
+    logger.info("Scoring %d CMLs from %s", len(features), source)
+    try:
+        predictions, probabilities = _predict(loaded, features[columns])
+    except Exception as exc:
+        logger.exception("Model inference failed for %s", source)
+        raise _server_error(request, "Model inference") from exc
+
+    # Positional access throughout: ``iterrows`` yields index *labels*,
+    # which are only interchangeable with positions for a default
+    # RangeIndex, and predictions are positional numpy arrays.
+    ids = features["id_number"].astype(str).tolist()
+
+    # Expert decisions supersede the model. Until now the override store
+    # was written but never read back into a scoring run, so an engineer
+    # could record "KEEP this CML" and the next run still said ELIMINATE.
+    overrides = sme_manager.get_override_map()
+
+    results = []
+    for position in range(len(features)):
+        model_recommendation = "ELIMINATE" if predictions[position] == 1 else "KEEP"
+        override = overrides.get(ids[position])
+        results.append(
+            {
+                "id_number": ids[position],
+                "predicted_elimination_flag": int(predictions[position]),
+                "elimination_probability": float(probabilities[position]),
+                "model_recommendation": model_recommendation,
+                # The safe default: a client that reads only
+                # "recommendation" must not be shown a decision an
+                # engineer has already overruled.
+                "recommendation": override["sme_decision"] if override else model_recommendation,
+                "confidence": "HIGH"
+                if abs(probabilities[position] - 0.5) > HIGH_CONFIDENCE_MARGIN
+                else "MODERATE",
+                "sme_override": _override_summary(override),
+            }
+        )
+
+    return results, columns, validation
+
+
 @app.get("/", tags=["meta"])
 async def root() -> dict[str, str]:
     """Service banner with a pointer to the interactive documentation."""
@@ -243,14 +391,21 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok" if model is not None else "degraded",
         "model_loaded": model is not None,
-        "model_path": str(settings.MODEL_PATH) if settings.MODEL_PATH.exists() else None,
+        # File name only: this probe is never gated, and the absolute path
+        # disclosed the server's directory layout to anyone.
+        "model_path": settings.MODEL_PATH.name if settings.MODEL_PATH.exists() else None,
         "version": settings.API_VERSION,
         # Reports whether a key is required, never the key itself.
         "auth": settings.API_KEY_SCOPE if settings.API_KEY else "disabled",
     }
 
 
-@app.get("/metrics", response_class=PlainTextResponse, tags=["meta"])
+@app.get(
+    "/metrics",
+    response_class=PlainTextResponse,
+    tags=["meta"],
+    dependencies=[Depends(require_api_key_for_reads)],
+)
 async def prometheus_metrics() -> PlainTextResponse:
     """Prometheus text-format metrics for this process.
 
@@ -275,7 +430,9 @@ async def model_info() -> dict[str, Any]:
     return {
         "model_type": type(loaded).__name__,
         "features_used": _feature_columns(loaded),
-        "model_path": str(settings.MODEL_PATH),
+        # The file name identifies the artifact; the directory is the
+        # operator's own configuration (MODEL_DIR) and not the caller's business.
+        "model_path": settings.MODEL_PATH.name,
     }
 
 
@@ -311,11 +468,14 @@ async def upload_cml_data(file: UploadFile = File(...)) -> dict[str, Any]:
     dependencies=[Depends(require_api_key_for_reads)],
 )
 async def score_cml_data(
+    request: Request,
     file: UploadFile = File(...),
     offset: int = Query(0, ge=0, description="Index of the first result to return, for paging"),
     limit: int | None = Query(
         None,
         ge=1,
+        # No page can be larger than the largest accepted upload.
+        le=settings.MAX_UPLOAD_ROWS,
         description="Maximum results to return. Defaults to MAX_RESULTS_IN_RESPONSE.",
     ),
 ) -> dict[str, Any]:
@@ -329,57 +489,7 @@ async def score_cml_data(
     """
     loaded = _require_model()
     df = await read_upload(file, settings.MAX_UPLOAD_BYTES, settings.MAX_UPLOAD_ROWS)
-
-    validation = validate_cml_dataframe(df)
-    if not validation["valid"]:
-        raise UploadError("; ".join(validation["errors"]))
-
-    features = engineer_features(df, minimum_thickness_mm=settings.DEFAULT_MINIMUM_THICKNESS)
-
-    columns = _feature_columns(loaded)
-    missing = [column for column in columns if column not in features.columns]
-    if missing:
-        raise UploadError(f"Missing columns required by the model: {', '.join(missing)}")
-
-    logger.info("Scoring %d CMLs from %s", len(features), file.filename)
-    try:
-        predictions, probabilities = _predict(loaded, features[columns])
-    except Exception as exc:
-        logger.exception("Model inference failed for %s", file.filename)
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Model inference failed: {exc}"
-        ) from exc
-
-    # Positional access throughout: ``iterrows`` yields index *labels*,
-    # which are only interchangeable with positions for a default
-    # RangeIndex, and predictions are positional numpy arrays.
-    ids = features["id_number"].astype(str).tolist()
-
-    # Expert decisions supersede the model. Until now the override store
-    # was written but never read back into a scoring run, so an engineer
-    # could record "KEEP this CML" and the next run still said ELIMINATE.
-    overrides = sme_manager.get_override_map()
-
-    results = []
-    for position in range(len(features)):
-        model_recommendation = "ELIMINATE" if predictions[position] == 1 else "KEEP"
-        override = overrides.get(ids[position])
-        results.append(
-            {
-                "id_number": ids[position],
-                "predicted_elimination_flag": int(predictions[position]),
-                "elimination_probability": float(probabilities[position]),
-                "model_recommendation": model_recommendation,
-                # The safe default: a client that reads only
-                # "recommendation" must not be shown a decision an
-                # engineer has already overruled.
-                "recommendation": override["sme_decision"] if override else model_recommendation,
-                "confidence": "HIGH"
-                if abs(probabilities[position] - 0.5) > HIGH_CONFIDENCE_MARGIN
-                else "MODERATE",
-                "sme_override": _override_summary(override),
-            }
-        )
+    results, columns, _ = _score(request, loaded, df, source=file.filename)
 
     overridden = sum(1 for result in results if result["sme_override"] is not None)
     logger.info(
@@ -410,6 +520,27 @@ async def score_cml_data(
         },
         "message": f"Successfully scored {len(results)} CML records",
     }
+
+
+@app.post(
+    "/predict",
+    response_model=PredictResponse,
+    tags=["scoring"],
+    dependencies=[Depends(require_api_key_for_reads)],
+)
+async def predict(request: Request, record: CMLRecord) -> dict[str, Any]:
+    """Score one CML sent as JSON, without building a file.
+
+    The same pipeline as ``/score-cml-data`` -- features, model, risk
+    classification and SME overrides -- so the answer is identical to the
+    one the same CML gets inside a batch.
+    """
+    loaded = _require_model()
+    row = record.model_dump(exclude_none=True)
+    results, _, validation = _score(request, loaded, pd.DataFrame([row]), source="JSON record")
+    result = results[0]
+    metrics.observe_scoring(1, 1 if result["sme_override"] is not None else 0)
+    return {**result, "warnings": validation["warnings"]}
 
 
 @app.post(
@@ -474,7 +605,7 @@ async def forecast_remaining_life(file: UploadFile = File(...)) -> list[Forecast
     tags=["reporting"],
     dependencies=[Depends(require_api_key_for_reads)],
 )
-async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
+async def generate_report(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
     """Score a file and summarise the results as an elimination report.
 
     Aggregates predictions by commodity and feature type and surfaces the
@@ -484,6 +615,7 @@ async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
     loaded = _require_model()
     df = await read_upload(file, settings.MAX_UPLOAD_BYTES, settings.MAX_UPLOAD_ROWS)
 
+    df = _normalise_text(df)
     validation = validate_cml_dataframe(df)
     if not validation["valid"]:
         raise UploadError("; ".join(validation["errors"]))
@@ -500,9 +632,7 @@ async def generate_report(file: UploadFile = File(...)) -> dict[str, Any]:
         features["elimination_probability"] = probabilities
     except Exception as exc:
         logger.exception("Model inference failed while generating a report")
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Model inference failed: {exc}"
-        ) from exc
+        raise _server_error(request, "Model inference") from exc
 
     features["recommendation"] = features["predicted_elimination"].map({1: "ELIMINATE", 0: "KEEP"})
 
@@ -545,7 +675,7 @@ async def list_sme_overrides() -> dict[str, Any]:
     tags=["sme"],
     dependencies=[Depends(require_api_key)],
 )
-async def create_sme_override(override: SMEOverride) -> dict[str, Any]:
+async def create_sme_override(request: Request, override: SMEOverride) -> dict[str, Any]:
     """Record an expert decision that supersedes the model's recommendation.
 
     Overrides are keyed by CML id: posting the same id again replaces the
@@ -562,16 +692,16 @@ async def create_sme_override(override: SMEOverride) -> dict[str, Any]:
         )
     except OSError as exc:
         logger.exception("Failed to persist SME override for %s", override.id_number)
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Could not persist the override: {exc}"
-        ) from exc
+        raise _server_error(request, "Saving the override") from exc
 
     logger.info("Recorded SME override for %s by %s", override.id_number, override.sme_name)
     return {"override": stored, "message": f"Override recorded for {override.id_number}"}
 
 
 @app.delete(
-    "/sme-override/{id_number}",
+    # :path, because real plant tags contain slashes (10-P-1001/A). Without
+    # it such an override could be recorded but never withdrawn.
+    "/sme-override/{id_number:path}",
     tags=["sme"],
     dependencies=[Depends(require_api_key)],
 )

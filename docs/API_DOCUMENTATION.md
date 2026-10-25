@@ -12,10 +12,12 @@ historical behaviour. Set it (16+ characters) and callers must send
 | `API_KEY_SCOPE` | Gated |
 | --- | --- |
 | `writes` (default) | `POST`/`DELETE /sme-override` |
-| `all` | Everything except `/` and `/health` |
+| `all` | Every endpoint except `/` and `/health`, including `/metrics` |
 
 `/` and `/health` are never gated — an orchestrator cannot attach
-credentials to a liveness probe. `GET /health` reports the active posture
+credentials to a liveness probe. The interactive docs (`/docs`, `/redoc`,
+`/openapi.json`) are not gated either: they describe the API, which is
+generated from code that is already public, and expose no data. `GET /health` reports the active posture
 as `"auth": "disabled" | "writes" | "all"`, never the key itself.
 
 A rejected request returns `401` with `WWW-Authenticate: X-API-Key`.
@@ -29,7 +31,12 @@ identity still requires real authentication upstream.
 ## Conventions
 
 Every response carries an `x-request-id` header. Supply your own to correlate a
-client-side report with server logs; otherwise one is generated.
+client-side report with server logs; otherwise one is generated. A supplied id
+is kept only if it is 1–64 characters of `A-Z a-z 0-9 . _ -`, because it is
+written to every log line for the request; anything else is replaced.
+
+A `500` names the step that failed and the request id, never the underlying
+exception — that is in the server log, against the same id.
 
 | Status | Meaning |
 | --- | --- |
@@ -44,8 +51,14 @@ client-side report with server logs; otherwise one is generated.
 Errors return `{"detail": "...", "request_id": "..."}`. A `400` always names
 what to fix.
 
-Upload endpoints accept `.csv`, `.xlsx` and `.xls` as `multipart/form-data`
-under the field name `file`. Defaults: 25 MB and 100,000 rows.
+Upload endpoints accept `.csv` and `.xlsx` as `multipart/form-data` under
+the field name `file`. Defaults: 25 MB and 100,000 rows (sizes here are
+binary: 1 MB = 1,048,576 bytes). A CSV may have at most 256 columns (the schema
+has twelve); a data row wider than the header is a parse error, and the
+header and first data row may each be at most 64 KB. An `.xlsx` may decompress
+to at most 4 × the byte limit, with a shared-strings table of at most 16 MB.
+`id_number` is always read as text, so leading zeros survive. Legacy `.xls` is
+not accepted: no reader for it is installed, so it never worked.
 
 ---
 
@@ -67,7 +80,7 @@ Liveness and readiness. Used by the Docker healthcheck and the dashboard.
 {
   "status": "ok",
   "model_loaded": true,
-  "model_path": "/app/models/cml_elimination_model.joblib",
+  "model_path": "cml_elimination_model.joblib",
   "version": "1.0.0"
 }
 ```
@@ -207,7 +220,7 @@ curl -X POST http://localhost:8000/score-cml-data -F "file=@data/cml_sample_500.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `offset` | `0` | Index of the first result to return |
-| `limit` | `MAX_RESULTS_IN_RESPONSE` (100) | Maximum results in this page |
+| `limit` | `MAX_RESULTS_IN_RESPONSE` (100) | Maximum results in this page, at most `MAX_UPLOAD_ROWS` |
 
 Every row is always scored; these page over the response body only.
 Omitting both reproduces the previous behaviour exactly.
@@ -222,6 +235,48 @@ incomplete file), `401` (auth enabled, key missing), `503` (no model),
 `500` (inference failed).
 
 ---
+
+## `POST /predict`
+
+Scores one CML sent as JSON — no file needed. It runs the same pipeline as
+`/score-cml-data` (normalisation, features, model, SME overrides), so a CML
+gets the same answer here as inside a batch. Tests assert that row by row,
+including for padded text, ids with leading zeros, and dates in formats other
+than `YYYY-MM-DD`.
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"id_number": "CML-042", "average_corrosion_rate": 0.12, "thickness_mm": 9.5,
+       "commodity": "Crude Oil", "feature_type": "Pipe", "cml_shape": "Internal"}'
+```
+
+```json
+{
+  "id_number": "CML-042",
+  "predicted_elimination_flag": 0,
+  "elimination_probability": 0.028189334573614028,
+  "model_recommendation": "KEEP",
+  "recommendation": "KEEP",
+  "confidence": "HIGH",
+  "sme_override": null,
+  "warnings": []
+}
+```
+
+The body takes the columns an upload does. The six required ones must be
+present; `risk_score`, `minimum_thickness_mm`, `remaining_life_years` and
+`last_inspection_date` are optional and derived or defaulted when omitted,
+exactly as for a file. `last_inspection_date` is a string parsed by the same
+code as an upload's column; use `YYYY-MM-DD`, since other orders are guessed
+per value (see #27). Surrounding whitespace in `id_number`, `commodity`,
+`feature_type` and `cml_shape` is ignored here and in uploads alike. Unknown fields are rejected rather than
+ignored, so a misspelt optional field cannot silently fall back to its default.
+
+Out-of-range values (a 900 mm wall, a negative corrosion rate) are scored and
+reported in `warnings`, as an upload reports them. Wrong types, missing
+fields, `Infinity`/`NaN` and over-long strings return `422`. `503` if no
+model is loaded. Gated like the other reads when `API_KEY_SCOPE=all`.
 
 ## `POST /forecast-remaining-life`
 
@@ -326,12 +381,16 @@ curl -X POST http://localhost:8000/sme-override \
 
 | Field | Required | Constraint |
 | --- | --- | --- |
-| `id_number` | yes | — |
+| `id_number` | yes | 1–64 characters, no control characters |
 | `sme_decision` | yes | `KEEP` or `ELIMINATE` |
-| `reason` | yes | At least 10 characters |
-| `sme_name` | yes | — |
-| `original_prediction` | no | Feeds the agreement rate |
+| `reason` | yes | 10–2,000 characters; may span lines, no other control characters |
+| `sme_name` | yes | 1–128 characters, no control characters |
+| `original_prediction` | no | `KEEP` or `ELIMINATE`; feeds the agreement rate |
 | `original_probability` | no | `[0, 1]` |
+
+Leading and trailing whitespace is stripped before the limits apply, so a
+reason of ten spaces is empty. These fields are written to the server log, which
+is why control characters (including newlines, outside `reason`) are refused.
 
 Posting the same `id_number` again **replaces** the previous decision. A
 violated constraint returns `422`.
@@ -369,7 +428,9 @@ model's field credibility and is worth watching over time.
 
 ### `DELETE /sme-override/{id_number}`
 
-`200` on removal, `404` if there was nothing to remove.
+`200` on removal, `404` if there was nothing to remove. Identifiers containing
+`/` (plant tags such as `10-P-1001/A`) are passed as-is:
+`DELETE /sme-override/10-P-1001/A`.
 
 ---
 

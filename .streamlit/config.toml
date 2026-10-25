@@ -9,3 +9,6 @@ font = "sans serif"
 headless = true
 port = 8501
 enableCORS = false
+# Matches the API's MAX_UPLOAD_BYTES (25 MB). Streamlit's default is 200 MB,
+# held in memory before the shared upload checks could reject it.
+maxUploadSize = 25

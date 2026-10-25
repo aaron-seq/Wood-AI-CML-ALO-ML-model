@@ -34,8 +34,22 @@ Forecasting keeps working without a model; only scoring and reporting need one.
 
 ## `400 Unsupported file format`
 
-Only `.csv`, `.xlsx` and `.xls` are accepted, matched on the filename
-extension. A CSV named `export` with no extension is rejected — rename it.
+Only `.csv` and `.xlsx` are accepted, matched on the filename extension. A CSV
+named `export` with no extension is rejected — rename it. Save legacy `.xls`
+workbooks as `.xlsx` or CSV.
+
+## `400 ... columns; at most 256 are accepted` / `longer than 64 KB` / `Expected N fields` / `shared strings table`
+
+A row is wider than any real CML export, which usually means the wrong
+delimiter or a corrupt file. `Expected N fields in line L, saw M` means line L
+has more fields than the header — often an unquoted comma inside a value. The shared-strings message applies to `.xlsx`
+only: the workbook carries an unusually large text table. Either way, export
+the sheet as CSV.
+
+## `400 The file is not a valid .xlsx workbook`
+
+The file is named `.xlsx` but is something else — a renamed `.ods`, `.xlsb`
+or `.xls`, or a damaged download. Re-save it from the spreadsheet as `.xlsx`.
 
 ## `400 Missing required columns: ...`
 
@@ -47,12 +61,22 @@ carry trailing spaces in headers.
 Use `/upload-cml-data` to inspect a file without scoring it — it returns the
 columns it found plus a full validation report.
 
-## `400 File is too large` / `exceeds the ... row limit`
+## `400 File is too large` / `more than ... rows, the row limit` / `would decompress to`
 
 Defaults are 25 MB and 100,000 rows. Split the file, or raise
 `MAX_UPLOAD_BYTES` / `MAX_UPLOAD_ROWS` — but note uploads are parsed in memory,
 so raising the limit raises the worker's memory ceiling. Size the container to
 match.
+
+The row-limit message says "more than" rather than giving a count: reading
+stops one row past the limit, so an oversized file costs no more to reject
+than one at the limit.
+
+`would decompress to ... MB` applies to `.xlsx` only. A workbook is a zip
+archive, and one may decompress to at most 4 × `MAX_UPLOAD_BYTES` (100 MB by
+default). A legitimate 100,000-row workbook decompresses to about 57 MB. If
+yours is rejected, upload it as CSV, which has no such step and parses about
+70 times faster.
 
 ## `400 The file could not be parsed`
 
