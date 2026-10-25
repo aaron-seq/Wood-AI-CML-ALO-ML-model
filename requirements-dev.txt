@@ -17,3 +17,7 @@ hypothesis>=6.165.3,<7.0
 # failure rather than as a mystery months later. The seed is printed;
 # reproduce with -p no:randomly or --randomly-seed=<n>.
 pytest-randomly>=4.1.0,<5.0
+# Python 3.11 bundles setuptools 79, which has PYSEC-2026-3447 and
+# GHSA-xmj3-9gf7-h52w. Not imported by the project; floored so a 3.11
+# development environment passes `make audit`.
+setuptools>=84.1.0
