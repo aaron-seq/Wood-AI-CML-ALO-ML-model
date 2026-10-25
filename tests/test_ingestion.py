@@ -230,28 +230,71 @@ class TestWidthAndMemberBounds:
             parse_within_limits(f"{header}\n".encode(), "w.csv", 10_000_000, 1000)
         assert not parsed
 
-    def test_a_data_row_wider_than_the_column_limit_is_rejected_before_parsing(self, monkeypatch):
-        """Found while retesting the header check: a 4 MB CSV with a normal
-        12-column header and one 2,000,000-field row was *accepted* after
-        187 s and +3.8 GB, because pandas turns surplus fields into index
-        levels. Width must be bounded on every row read, not the header."""
+    @pytest.mark.parametrize(
+        "layout",
+        [
+            pytest.param("a,b,c\n1,2,3\n{row}\n", id="after-a-row"),
+            # Found by review: blank lines (which pandas skips) or a quoted
+            # newline pushed a wide row past a physical-line scan, and it was
+            # accepted with ~50,000 index levels.
+            pytest.param("a,b,c\n" + "\n" * 50 + "{row}\n", id="after-blank-lines"),
+            pytest.param('a,b,c\n"1\n2",2,3\n{row}\n', id="after-a-quoted-newline"),
+        ],
+    )
+    def test_a_data_row_wider_than_its_header_is_rejected(self, layout):
+        """pandas turns surplus fields into index levels: a 2,000,000-field
+        row cost 187 s and 3.8 GB to accept."""
+        row = ",".join("1" for _ in range(50_000))
+        with pytest.raises(UploadError, match="could not be parsed|columns"):
+            parse_within_limits(layout.format(row=row).encode(), "w.csv", 10_000_000, 3)
+
+    # pandas warns that index_col=False drops the empty trailing field, which
+    # is exactly the intent here.
+    @pytest.mark.filterwarnings("ignore::pandas.errors.ParserWarning")
+    def test_a_trailing_delimiter_on_every_row_still_parses(self):
+        parsed = parse_within_limits(b"a,b,c\n1,2,3,\n4,5,6,\n", "t.csv", 10_000_000, 10)
+        assert parsed.to_dict("records") == [{"a": 1, "b": 2, "c": 3}, {"a": 4, "b": 5, "c": 6}]
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"], ids=["LF", "CRLF", "CR"])
+    def test_every_line_ending_parses(self, newline):
+        """A CR-only file was rejected as one 306-column line."""
+        payload = newline.join(["a,b,c,d,e,f", *["1,2,3,4,5,6"] * 60]).encode()
+        assert parse_within_limits(payload, "e.csv", 10_000_000, 100).shape == (60, 6)
+
+    def test_a_header_hidden_behind_a_quoted_newline_is_still_bounded(self):
         from app import ingestion
 
-        row = ",".join("1" for _ in range(ingestion.MAX_COLUMNS + 1))
+        header = '"a\nb",' + ",".join(f"c{i}" for i in range(ingestion.MAX_COLUMNS + 1))
+        with pytest.raises(UploadError, match="columns"):
+            parse_within_limits(f"{header}\n1\n".encode(), "h.csv", 10_000_000, 10)
+
+    def test_an_endless_header_is_rejected_unparsed(self, monkeypatch):
+        from app import ingestion
+
         parsed = []
         monkeypatch.setattr(pd, "read_csv", lambda *a, **k: parsed.append(1))
-        with pytest.raises(UploadError, match="columns"):
-            parse_within_limits(f"a,b,c\n1,2,3\n{row}\n".encode(), "w.csv", 10_000_000, 1000)
+        payload = b"x" * (ingestion.MAX_RECORD_BYTES + 1)
+        with pytest.raises(UploadError, match="header"):
+            parse_within_limits(payload, "h.csv", 10_000_000, 10)
         assert not parsed
 
-    def test_only_the_rows_that_would_be_read_are_scanned(self):
-        """Rows past the row limit are never parsed, so they need no scan."""
+    def test_an_endless_first_data_row_is_rejected_quickly(self):
+        """A first row of 25 MB of quote characters cost 4.6 s to scan."""
+        import time
+
         from app import ingestion
 
-        wide = ",".join("1" for _ in range(ingestion.MAX_COLUMNS + 1))
-        payload = ("a,b\n" + "1,2\n" * 5 + wide + "\n").encode()
-        with pytest.raises(UploadError, match="more than 3 rows"):
-            parse_within_limits(payload, "w.csv", 10_000_000, 3)
+        payload = b"a\n" + b'"' * (ingestion.MAX_RECORD_BYTES * 8)
+        started = time.perf_counter()
+        with pytest.raises(UploadError, match="first data row"):
+            parse_within_limits(payload, "q.csv", 10_000_000, 10)
+        assert time.perf_counter() - started < 1.0
+
+    def test_identifiers_keep_their_leading_zeros(self):
+        """id_number was type-inferred, so 00042 became 42 and missed any
+        override recorded against 00042."""
+        parsed = parse_within_limits(b"id_number,x\n00042,1\n", "i.csv", 10_000_000, 10)
+        assert parsed.loc[0, "id_number"] == "00042"
 
     def test_a_csv_at_the_column_limit_is_accepted(self):
         from app import ingestion

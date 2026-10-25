@@ -14,9 +14,9 @@ server fault.
 from __future__ import annotations
 
 import logging
+import re
 import zipfile
 from io import BytesIO
-from itertools import islice
 from pathlib import PurePosixPath
 from xml.etree.ElementTree import ParseError
 
@@ -42,8 +42,14 @@ INFLATION_ALLOWANCE = 4
 
 # The documented schema has twelve columns. Rows were bounded but width was
 # not: an 889 KB CSV with 100,000 columns parsed at +120 MB, and memory grows
-# with the column count. Checked on the raw header before pandas allocates.
+# with the column count. A CSV header is checked before pandas allocates;
+# data rows wider than the header are refused by the parser itself.
 MAX_COLUMNS = 256
+# The header and first data row are measured before parsing (see
+# _check_csv_width), so their length is bounded too, which caps that scan at
+# ~10 ms: unbounded, a first row of 25 MB of quote characters took 4.6 s.
+# A CML row is well under 1 KB; 256 column names fit many times over.
+MAX_RECORD_BYTES = 64 * 1024
 
 # A workbook's shared-strings table is parsed in full when it opens, before
 # any row limit can apply, and costs about 20x more per byte than sheet XML:
@@ -54,6 +60,10 @@ SHARED_STRINGS_PART = "xl/sharedStrings.xml"
 
 # A spreadsheet has a few dozen parts; thousands are only useful to an attacker.
 MAX_ARCHIVE_MEMBERS = 1000
+
+# Identifiers are labels, not numbers: inferred as integers, "00042" became 42
+# and no longer matched an override recorded against "00042".
+_ID_AS_TEXT = {"id_number": str}
 
 # What openpyxl raises for a zip that is not a readable workbook. Mapped to a
 # 400: each used to escape as a 500.
@@ -111,26 +121,66 @@ def _check_archive(payload: bytes, limit: int) -> None:
         )
 
 
-def _check_csv_width(payload: bytes, lines: int | None) -> None:
-    """Reject a CSV with any row wider than MAX_COLUMNS fields.
+_CSV_SIGNIFICANT = re.compile(rb'[",\r\n]')
 
-    Every row that will be read is checked, not just the header: when a row
-    is wider than its header, pandas promotes the surplus fields to index
-    levels, and one 2,000,000-field row cost 187 s and 3.8 GB to accept.
-    Counts delimiters in raw bytes, so nothing is allocated per field; a
-    quoted comma counts too, which can only make the check stricter.
 
-    Args:
-        payload: The raw CSV.
-        lines: How many lines pandas will read (header included); ``None``
-            scans them all.
+def _record_width(payload: bytes, start: int, what: str) -> tuple[int, int]:
+    """Count the fields of the CSV record starting at ``start``.
+
+    Quote-aware, ends at the first unquoted CR or LF (any line ending), and
+    returns as soon as the record passes MAX_COLUMNS fields. Only quotes,
+    commas and line breaks are visited, so long text fields cost nothing.
+
+    Returns:
+        ``(fields, end)`` where ``end`` is the offset of the terminator, or
+        ``len(payload)`` if the record runs to the end.
+
+    Raises:
+        UploadError: If the record is too wide or longer than MAX_RECORD_BYTES.
     """
-    for line in islice(BytesIO(payload), lines):
-        columns = line.count(b",") + 1
-        if columns > MAX_COLUMNS:
-            raise UploadError(
-                f"A row has {columns:,} columns; at most {MAX_COLUMNS:,} are accepted."
-            )
+    fields, quoted = 1, False
+    for match in _CSV_SIGNIFICANT.finditer(payload, start):
+        if match.start() - start > MAX_RECORD_BYTES:
+            break
+        char = match.group()
+        if char == b'"':
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif char == b",":
+            fields += 1
+            if fields > MAX_COLUMNS:
+                raise UploadError(
+                    f"A row has more than {MAX_COLUMNS:,} columns; "
+                    f"at most {MAX_COLUMNS:,} are accepted."
+                )
+        else:
+            return fields, match.start()
+    if len(payload) - start > MAX_RECORD_BYTES:
+        raise UploadError(
+            f"The {what} is longer than {MAX_RECORD_BYTES // 1024} KB. "
+            "Check that the file is a CSV with one record per line."
+        )
+    return fields, len(payload)
+
+
+def _check_csv_width(payload: bytes) -> None:
+    """Reject a CSV whose header or first data row is too wide.
+
+    Rows after the first are refused by the parser itself when wider than
+    the header (``index_col=False``). The first data row is the exception:
+    pandas truncates it with a warning instead, so it is measured here, as
+    is the header, which pandas must fully materialise before anything else
+    applies. A scan of physical lines was tried first and was wrong: pandas
+    skips blank lines and quoted fields span lines, so a wide row could sit
+    past the scan and be accepted with ~50,000 index levels.
+    """
+    _, end = _record_width(payload, 0, "header row")
+    # pandas skips blank lines, so the first data row is the next non-blank one.
+    while end < len(payload) and payload[end] in b"\r\n":
+        end += 1
+    if end < len(payload):
+        _record_width(payload, end, "first data row")
 
 
 def parse_bytes(
@@ -172,19 +222,24 @@ def parse_bytes(
     nrows = None if max_rows is None else max_rows + 1
 
     if suffix in CSV_SUFFIXES:
-        # The header plus the rows pandas will read.
-        _check_csv_width(payload, None if nrows is None else nrows + 1)
+        _check_csv_width(payload)
     elif max_inflated_bytes is not None:
         _check_archive(payload, max_inflated_bytes)
 
     try:
         if suffix in CSV_SUFFIXES:
-            frame = pd.read_csv(BytesIO(payload), nrows=nrows)
+            # index_col=False: a row with more fields than the header is a
+            # parse error. By default pandas promoted the surplus to index
+            # levels, so one 2,000,000-field row cost 187 s and 3.8 GB to
+            # accept, and rows with a trailing delimiter were mis-shifted.
+            frame = pd.read_csv(BytesIO(payload), nrows=nrows, index_col=False, dtype=_ID_AS_TEXT)
         else:
             # Pinned: pandas otherwise picks a reader from the archive's
             # contents, so a renamed .ods or .xlsb reached readers that are
             # not installed and failed with ImportError.
-            frame = pd.read_excel(BytesIO(payload), nrows=nrows, engine="openpyxl")
+            frame = pd.read_excel(
+                BytesIO(payload), nrows=nrows, engine="openpyxl", dtype=_ID_AS_TEXT
+            )
     except _WORKBOOK_ERRORS as exc:
         # None of these is a ValueError, so each used to escape as a 500.
         raise UploadError("The file is not a valid .xlsx workbook.") from exc

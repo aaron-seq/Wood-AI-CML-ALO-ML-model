@@ -38,10 +38,11 @@ Only `.csv` and `.xlsx` are accepted, matched on the filename extension. A CSV
 named `export` with no extension is rejected — rename it. Save legacy `.xls`
 workbooks as `.xlsx` or CSV.
 
-## `400 ... columns; at most 256 are accepted` / `shared strings table`
+## `400 ... columns; at most 256 are accepted` / `longer than 64 KB` / `Expected N fields` / `shared strings table`
 
 A row is wider than any real CML export, which usually means the wrong
-delimiter or a corrupt file. The shared-strings message applies to `.xlsx`
+delimiter or a corrupt file. `Expected N fields in line L, saw M` means line L
+has more fields than the header — often an unquoted comma inside a value. The shared-strings message applies to `.xlsx`
 only: the workbook carries an unusually large text table. Either way, export
 the sheet as CSV.
 
