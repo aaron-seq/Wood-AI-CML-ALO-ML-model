@@ -228,22 +228,26 @@ database.
 
 ## Future work
 
-Ordered by what most limits production readiness:
+Tracked as GitHub issues, which are the source of truth for status. In order
+of what most limits production readiness:
 
-1. **Validate against real inspection outcomes.** Everything else is secondary
-   to knowing whether the model works on field data.
-2. **Authentication and authorisation**, so overrides are attributable to an
-   identity rather than a free-text `sme_name`.
-3. **Move overrides to a database** with row-level locking; removes the
-   single-host constraint that the advisory lock leaves in place.
-4. **Revisit calibration once the model is worth calibrating.**
-   `CalibratedClassifierCV` is already wired in behind
-   `make train CALIBRATE=sigmoid`, but on the current data it costs more F1
-   than it recovers in calibration error (see MODEL_CARD.md).
-5. **Stream or queue large uploads** instead of parsing them in-request.
-6. **Distributed tracing** — OpenTelemetry spans. Prometheus counters and
-   request ids are in place; spans across the dashboard/API boundary are not.
-7. **Per-circuit minimum thickness.** `app/risk.py` uses one global 3.0 mm
-   floor; real programmes derive it per circuit from design pressure and
-   material, which would also let the risk thresholds be calibrated rather
-   than inherited.
+1. **Validate against real inspection outcomes** — [#24](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues/24).
+   Everything else is secondary to knowing whether the model works on field data.
+2. **Retrain the served model and record its provenance** — [#20](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues/20).
+   The served artifact is still the 200-row model; needs an owner's decision.
+3. **Attribute overrides to a verified identity** — [#23](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues/23).
+4. **Move overrides to a database**, with history and more than one replica — [#22](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues/22).
+5. **Score large uploads off the request path**, once a load test says it is needed — [#26](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues/26).
+6. **Evaluate alternative classifiers** against the RF baseline — [#21](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues/21).
+7. **Pin Actions to commit SHAs** — [#25](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues/25); smaller hardening items in [#27](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues/27).
+
+Not yet tracked, because nothing yet justifies the work:
+
+- **Calibration**, once the model is worth calibrating. `CalibratedClassifierCV`
+  is wired in behind `make train CALIBRATE=sigmoid`, but on the current data it
+  costs more F1 than it recovers in calibration error (ADR-0007).
+- **Distributed tracing.** Request ids and Prometheus counters are in place;
+  spans across the dashboard/API boundary are not.
+- **Calibrated risk thresholds.** A per-CML `minimum_thickness_mm` is accepted,
+  but the risk bands in `app/risk.py` are still global constants inherited
+  rather than derived from design pressure and material.

@@ -266,6 +266,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
 | [Model card](docs/MODEL_CARD.md) | Intended use, metrics, limitations |
 | [ADRs](docs/adr/) | Why the significant decisions were made |
 | [Contributing](CONTRIBUTING.md) | Workflow and standards |
+| [Data](data/README.md) | The datasets, their columns, and how the labels were made |
+| [Security policy](SECURITY.md) | How to report a vulnerability; what deployers own |
+| [Project status](docs/PROJECT-STATUS.md) | Current state, open decisions, and where to resume |
 
 ---
 
@@ -288,7 +291,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
   request. Measured at 553 ms for 50,000 CMLs, so this is a concurrency limit
   rather than a latency one — see [measured throughput](docs/DEPLOYMENT.md#measured-throughput).
 
-Planned work is tracked in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#future-work).
+Planned work is tracked as [GitHub issues](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues), summarised in order in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#future-work).
 
 ---
 
