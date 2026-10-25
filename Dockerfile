@@ -40,7 +40,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
-COPY --chown=appuser:appuser . /app
+# Code is owned by root and only data/ belongs to the runtime user, so a
+# compromised process can write its own state but cannot rewrite the
+# application it is running.
+COPY . /app
+RUN mkdir -p /app/data && chown appuser:appuser /app/data
 
 # Run unprivileged: a container that only reads uploads and serves
 # predictions has no reason to hold root.
@@ -49,6 +53,8 @@ USER appuser
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:8000/health || exit 1
+    CMD curl -fsS "http://localhost:${PORT:-8000}/health" || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Shell form so HOST and PORT from the environment are honoured, as they are
+# outside the container; exec keeps uvicorn as PID 1 so it receives SIGTERM.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host \"${HOST:-0.0.0.0}\" --port \"${PORT:-8000}\""]

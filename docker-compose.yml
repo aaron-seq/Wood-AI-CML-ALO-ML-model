@@ -15,8 +15,11 @@ services:
       args:
         TARGET: api
     container_name: wood-cml-api
+    # Loopback only: authentication is off by default, so publishing on every
+    # interface would expose an unauthenticated API to the network. To serve
+    # other hosts, set API_KEY and change this to "8000:8000".
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       LOG_LEVEL: INFO
       ENVIRONMENT: docker
@@ -40,7 +43,7 @@ services:
         TARGET: dashboard
     container_name: wood-cml-dashboard
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     environment:
       # Reaches the API over the compose network, not localhost.
       CML_API_URL: http://api:8000

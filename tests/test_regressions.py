@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
+import subprocess
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -228,3 +231,41 @@ class TestPredictionRowAlignment:
         body = client.post("/score-cml-data", files=csv_upload(valid_cml_frame)).json()
         returned = [row["id_number"] for row in body["results"]]
         assert returned == valid_cml_frame["id_number"].tolist()
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OVERRIDE_STORE = "data/sme_overrides.json"
+
+
+class TestNoOverrideAuditTrailShips:
+    """A fresh install must start with an empty override audit trail.
+
+    The repository tracked a test record overriding CML-209 to ELIMINATE,
+    attributed to a named engineer with the reason "Eliminate". CML-209 is
+    in the bundled sample dataset, so every clone and every image silently
+    retired that inspection location against the model's KEEP. The compose
+    volume is seeded from the image, so the record also reached deployments.
+    """
+
+    def test_the_store_is_not_tracked_by_git(self):
+        if shutil.which("git") is None or not (REPO_ROOT / ".git").exists():
+            pytest.skip("not a git checkout")
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", OVERRIDE_STORE],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert tracked == "", f"{OVERRIDE_STORE} is tracked; it is per-deployment state"
+
+    def test_the_store_is_excluded_from_the_image(self):
+        patterns = (REPO_ROOT / ".dockerignore").read_text().splitlines()
+        assert OVERRIDE_STORE in patterns
+
+    def test_a_missing_store_applies_no_overrides(self, tmp_path):
+        manager = SMEOverrideManager(tmp_path / "sme_overrides.json")
+        frame = pd.DataFrame({"id_number": ["CML-209"], "recommendation": ["KEEP"]})
+        result = manager.apply_overrides_to_predictions(frame)
+        assert manager.get_override_map() == {}
+        assert result.loc[0, "recommendation"] == "KEEP"
