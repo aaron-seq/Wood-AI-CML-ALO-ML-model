@@ -5,7 +5,8 @@
 
 pytest>=9.1.1,<10.0  # PYSEC-2026-1845
 pytest-cov>=7.1.0,<8.0
-httpx>=0.28.1,<0.29
+# Starlette's TestClient prefers httpx2 and deprecates plain httpx (1.10+).
+httpx2>=2.16,<3.0
 ruff>=0.16.2,<0.17
 mypy>=2.3.0,<3.0
 pandas-stubs>=3.0.5.260730,<4.0
