@@ -35,6 +35,9 @@ _UNSAFE_IN_A_LOG_LINE = {
     code: f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
     for code in [*range(0x00, 0x20), *range(0x7F, 0xA0), 0x2028, 0x2029]
 }
+# The escape character itself, so a literal "\x0a" typed into a filename
+# cannot be mistaken for an escaped newline.
+_UNSAFE_IN_A_LOG_LINE[ord("\\")] = "\\\\"
 
 
 class TextFormatter(logging.Formatter):

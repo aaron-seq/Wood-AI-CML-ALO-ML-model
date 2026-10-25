@@ -22,16 +22,20 @@ check). That made all three open Dependabot PRs fail too. PR #19:
   #16 (Actions v7) and #18 (pip group: pandas 3, mypy 2, Streamlit 1.66) as
   cherry-picks with authorship kept, plus the fixes they needed.
 - **Fixes a shipped test override** that retired CML-209 on every fresh install.
-- **Bounds the cost of an upload** in rows, width, decompressed size and
-  shared strings, and parses off the event loop. One case found in retest — a
-  4 MB CSV accepted after 187 s and 3.8 GB — now fails in 10 ms.
+- **Bounds the cost of an upload** in rows, width, record length,
+  decompressed size and shared strings, and parses off the event loop. One
+  case found in retest — a 4 MB CSV accepted after 187 s and 3.8 GB — is now
+  refused in milliseconds, whether the wide row comes first, after blank lines
+  or after a quoted newline. Width beyond the first data row is enforced by
+  the parser itself (`index_col=False`), not re-implemented.
 - **Closes API-surface gaps**: an ungated `/metrics` at scope `all`, unbounded
   and log-forging override fields, exception text in 500s, unbounded `limit`,
   absolute paths in `/health` and `/model/info`, CSV formula injection in
   exports, forged text-log lines, a 500 on a non-ASCII key, a 500 on
   `Infinity`/`NaN` JSON, and a 500 on corrupt workbooks.
-- **Adds `POST /predict`** (#10), sharing one scoring path with batch uploads;
-  a parity test asserts identical results.
+- **Adds `POST /predict`** (#10), sharing one scoring path, including input
+  normalisation, with batch uploads. Parity tests cover messy input (padded
+  text, leading-zero ids, non-ISO dates), not only clean fixtures.
 - **Documents** the datasets and how their labels were made (#7),
   configuration (#12), `SECURITY.md`, and the upgrade step that removes the
   shipped CML-209 record from existing volumes.
@@ -45,11 +49,11 @@ by #20. #20–#27 were created for deferred work.
 | Check | Where | Result |
 | --- | --- | --- |
 | ruff lint + format, mypy (15 files) | local, Python 3.14 | clean |
-| pytest, 364 tests, 92% coverage (floor 90%) | local, Python 3.14; three random orders | all pass, zero warnings |
+| pytest, 381 tests, 93% coverage (floor 90%) | local, Python 3.14; three random orders | all pass, zero warnings |
 | Full suite | local, Python 3.11, 3.12, 3.13, 3.14 (earlier revision, 283 tests) | all pass |
-| 22 Hypothesis properties | local, 20 consecutive seeds | all pass |
+| 23 Hypothesis properties | local, 20 consecutive seeds | all pass |
 | pip-audit | local 3.13/3.14; CI on 3.14 | no known vulnerabilities |
-| All 9 CI jobs, including the Docker build and its image assertions | GitHub Actions at `0ecec75` | green |
+| All 9 CI jobs, including the Docker build and its image assertions | GitHub Actions at the PR head (check the latest run) | green at `0ecec75`; re-check for later commits |
 
 Commands: `make check` (or `ruff check . && ruff format --check . && mypy &&
 pytest --cov`); `pip-audit`; for the properties,
@@ -69,6 +73,7 @@ from the same system, not independent human review:
 | Security reviewer (read-only + local probes) | API, uploads, store, Docker, CI | 1 Medium, 5 Low, Informational | Reproduced the Medium; line numbers it cited were wrong and corrected |
 | Branch archaeologist (read-only) | `feature/multi-model-ml-support` | Nothing to port; idea tracked in #21 | Read the cited diff |
 | Fresh adversarial verifier | All fixes at `966d73f` | Broke the bounds (width, shared strings) and found 4 Lows | Reproduced each with independent probes before fixing; retested after |
+| Final diff reviewer | `966d73f..11834b0` | Broke the width fix (blank lines, quoted newlines), rejected CR-only CSVs, and found `/predict`/batch disagreements on messy input | Reproduced each; fixed at the root (parser-enforced width, one normalisation step) and retested |
 
 ## Gaps and decisions needed
 

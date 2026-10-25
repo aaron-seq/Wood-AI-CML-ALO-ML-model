@@ -52,10 +52,13 @@ Errors return `{"detail": "...", "request_id": "..."}`. A `400` always names
 what to fix.
 
 Upload endpoints accept `.csv` and `.xlsx` as `multipart/form-data` under
-the field name `file`. Defaults: 25 MB and 100,000 rows. Every row may have at
-most 256 columns (the schema has twelve). An `.xlsx` may decompress to at most
-4 × the byte limit, with a shared-strings table of at most 16 MB. Legacy `.xls`
-is not accepted: no reader for it is installed, so it never worked.
+the field name `file`. Defaults: 25 MB and 100,000 rows (sizes here are
+binary: 1 MB = 1,048,576 bytes). A CSV may have at most 256 columns (the schema
+has twelve); a data row wider than the header is a parse error, and the
+header and first data row may each be at most 64 KB. An `.xlsx` may decompress
+to at most 4 × the byte limit, with a shared-strings table of at most 16 MB.
+`id_number` is always read as text, so leading zeros survive. Legacy `.xls` is
+not accepted: no reader for it is installed, so it never worked.
 
 ---
 
@@ -236,8 +239,10 @@ incomplete file), `401` (auth enabled, key missing), `503` (no model),
 ## `POST /predict`
 
 Scores one CML sent as JSON — no file needed. It runs the same pipeline as
-`/score-cml-data` (features, model, SME overrides), so a CML gets the same
-answer here as inside a batch; a test asserts exactly that.
+`/score-cml-data` (normalisation, features, model, SME overrides), so a CML
+gets the same answer here as inside a batch. Tests assert that row by row,
+including for padded text, ids with leading zeros, and dates in formats other
+than `YYYY-MM-DD`.
 
 ```bash
 curl -X POST http://localhost:8000/predict \
@@ -261,8 +266,11 @@ curl -X POST http://localhost:8000/predict \
 
 The body takes the columns an upload does. The six required ones must be
 present; `risk_score`, `minimum_thickness_mm`, `remaining_life_years` and
-`last_inspection_date` (`YYYY-MM-DD`) are optional and derived or defaulted
-when omitted, exactly as for a file. Unknown fields are rejected rather than
+`last_inspection_date` are optional and derived or defaulted when omitted,
+exactly as for a file. `last_inspection_date` is a string parsed by the same
+code as an upload's column; use `YYYY-MM-DD`, since other orders are guessed
+per value (see #27). Surrounding whitespace in `id_number`, `commodity`,
+`feature_type` and `cml_shape` is ignored here and in uploads alike. Unknown fields are rejected rather than
 ignored, so a misspelt optional field cannot silently fall back to its default.
 
 Out-of-range values (a 900 mm wall, a negative corrosion rate) are scored and

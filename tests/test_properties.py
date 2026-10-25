@@ -50,15 +50,21 @@ class TestRemainingLifeInvariants:
     # Generated directly rather than filtered with assume(): thickness <= minimum
     # holds for ~2.5% of independent draws, which tripped Hypothesis's
     # filter_too_much health check on some seeds.
-    @given(minimum=minimums, deficit=st.floats(0.0, 1000.0), rate=rates)
-    def test_a_wall_at_or_below_the_minimum_has_no_life_left(self, minimum, deficit, rate):
+    @given(minimum=minimums, fraction=st.floats(0.0, 1.0), rate=rates)
+    def test_a_wall_at_or_below_the_minimum_has_no_life_left(self, minimum, fraction, rate):
         """True for *any* rate, including none at all.
 
         Hypothesis found this: the ceiling for a non-corroding wall was
         applied before the exhausted-wall check, so a wall already at its
         minimum reported 50 years where CMLForecaster reported zero.
         """
-        thickness = minimum - deficit
+        # Every draw is a real wall between zero and the minimum. (Subtracting a
+        # 0-1000 deficit instead made ~97% of draws negative readings.)
+        thickness = minimum * fraction
+        assert _life(thickness, rate, minimum) == 0.0
+
+    @given(thickness=st.floats(-1000.0, 0.0), rate=rates, minimum=minimums)
+    def test_a_negative_reading_has_no_life_left(self, thickness, rate, minimum):
         assert _life(thickness, rate, minimum) == 0.0
 
     @given(thickness=thicknesses, minimum=minimums)

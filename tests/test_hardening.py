@@ -200,6 +200,17 @@ class TestTextLogsCannotBeForged:
         assert separator not in line
         assert "FORGED" in line  # escaped, not dropped
 
+    def test_a_literal_escape_is_distinguishable_from_an_escaped_newline(self):
+        import logging
+
+        from app.observability import TextFormatter
+
+        def render(text):
+            record = logging.LogRecord("app", logging.INFO, __file__, 1, "%s", (text,), None)
+            return TextFormatter("%(message)s").format(record)
+
+        assert render("a\\x0ab") != render("a\nb")
+
     def test_tracebacks_keep_their_lines(self):
         import logging
         import sys

@@ -286,6 +286,25 @@ def _server_error(request: Request, what: str) -> HTTPException:
     )
 
 
+# Text columns whose surrounding whitespace is a data-entry artefact, not
+# meaning: " Crude Oil" was an unseen category to the model, and a padded id
+# never matched its override (override ids are stripped on entry).
+_TEXT_COLUMNS = ("id_number", "commodity", "feature_type", "cml_shape")
+
+
+def _normalise_text(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip surrounding whitespace from identifier and category columns.
+
+    Done here, on the one scoring path, so an upload and ``/predict`` treat
+    the same values identically.
+    """
+    df = df.copy()
+    for column in _TEXT_COLUMNS:
+        if column in df.columns:
+            df[column] = df[column].map(lambda v: v.strip() if isinstance(v, str) else v)
+    return df
+
+
 def _score(
     request: Request, loaded: Any, df: pd.DataFrame, *, source: str | None
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
@@ -303,6 +322,7 @@ def _score(
         UploadError: If the records fail validation or lack model features.
         HTTPException: 500 if inference fails.
     """
+    df = _normalise_text(df)
     validation = validate_cml_dataframe(df)
     if not validation["valid"]:
         raise UploadError("; ".join(validation["errors"]))
@@ -517,10 +537,6 @@ async def predict(request: Request, record: CMLRecord) -> dict[str, Any]:
     """
     loaded = _require_model()
     row = record.model_dump(exclude_none=True)
-    if "last_inspection_date" in row:
-        # As an upload delivers it, so date handling is shared too.
-        row["last_inspection_date"] = row["last_inspection_date"].isoformat()
-
     results, _, validation = _score(request, loaded, pd.DataFrame([row]), source="JSON record")
     result = results[0]
     metrics.observe_scoring(1, 1 if result["sme_override"] is not None else 0)
@@ -599,6 +615,7 @@ async def generate_report(request: Request, file: UploadFile = File(...)) -> dic
     loaded = _require_model()
     df = await read_upload(file, settings.MAX_UPLOAD_BYTES, settings.MAX_UPLOAD_ROWS)
 
+    df = _normalise_text(df)
     validation = validate_cml_dataframe(df)
     if not validation["valid"]:
         raise UploadError("; ".join(validation["errors"]))

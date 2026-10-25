@@ -58,6 +58,38 @@ class TestPredict:
         single.pop("warnings")
         assert single == batch[frame.loc[0, "id_number"]]
 
+    @pytest.mark.parametrize(
+        "messy",
+        [
+            pytest.param({"commodity": " Crude Oil "}, id="padded-category"),
+            pytest.param({"id_number": "  CML-001 "}, id="padded-id"),
+            pytest.param({"id_number": "00042"}, id="leading-zero-id"),
+            pytest.param({"last_inspection_date": "2020-01-15T10:00:00"}, id="datetime-string"),
+            # pandas guesses the order of an ambiguous date per value and warns
+            # when it reads one day-first. Parity holds; the ambiguity itself
+            # is pre-existing and tracked in #27.
+            pytest.param(
+                {"last_inspection_date": "15/01/2020"},
+                id="day-first-date",
+                marks=pytest.mark.filterwarnings("ignore:Parsing dates in:UserWarning"),
+            ),
+            pytest.param({"thickness_mm": 10}, id="integral-number"),
+        ],
+    )
+    def test_matches_batch_scoring_on_messy_input(self, client, csv_upload, messy):
+        """Found by review: the clean-fixture parity tests could not catch
+        that /predict stripped whitespace and parsed ids and dates
+        differently from an upload of the same values."""
+        record = {**RECORD, **messy}
+        import pandas as pd
+
+        batch = client.post("/score-cml-data", files=csv_upload(pd.DataFrame([record]))).json()[
+            "results"
+        ][0]
+        single = client.post("/predict", json=record).json()
+        single.pop("warnings")
+        assert single == batch
+
     def test_an_sme_override_supersedes_the_model(self, client):
         model_said = client.post("/predict", json=RECORD).json()["model_recommendation"]
         decision = "KEEP" if model_said == "ELIMINATE" else "ELIMINATE"
@@ -88,7 +120,7 @@ class TestPredict:
             {"id_number": "C" * 65},
             {"cml_shape": "Internal\nINFO forged"},
             {"unexpected_field": 1},
-            {"last_inspection_date": "not a date"},
+            {"last_inspection_date": 1579046400},
         ],
     )
     def test_rejects_malformed_records(self, client, change):

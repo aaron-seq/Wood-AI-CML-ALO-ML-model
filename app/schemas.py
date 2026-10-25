@@ -210,8 +210,14 @@ class CMLRecord(BaseModel):
         None, description="Retirement thickness; the global default when omitted"
     )
     remaining_life_years: float | None = Field(None, description="Derived when omitted")
-    last_inspection_date: date | None = Field(
-        None, description="Inspection age defaults to 365 days when omitted"
+    # Text, not a date type, so it is parsed by the same code as an upload's
+    # column: a typed field rejected "2020-01-15T10:00:00", which an upload
+    # accepts, and accepted the integer 1579046400 as an epoch date.
+    last_inspection_date: str | None = Field(
+        None,
+        max_length=32,
+        pattern=_NO_CONTROL_CHARS,
+        description="Parsed as in an upload. Inspection age defaults to 365 days when omitted",
     )
 
 
