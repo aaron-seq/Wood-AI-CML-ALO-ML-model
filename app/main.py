@@ -305,6 +305,26 @@ def _normalise_text(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _require_identifiers(df: pd.DataFrame) -> None:
+    """Refuse records without an id_number, naming the rows.
+
+    Every result and every override lookup is keyed by the id. pandas 3
+    keeps a missing value as NaN through ``astype(str)`` (pandas 2 produced
+    the string "nan"), so a blank id failed response validation and turned
+    the whole batch into a 500. Runs after normalisation, so an id of only
+    whitespace counts as blank.
+    """
+    ids = df["id_number"]
+    blank = ids.isna() | ids.map(lambda value: isinstance(value, str) and not value)
+    if blank.any():
+        rows = [str(position + 1) for position in blank.to_numpy().nonzero()[0][:5]]
+        more = "" if blank.sum() <= 5 else f" and {int(blank.sum()) - 5} more"
+        raise UploadError(
+            f"{int(blank.sum())} record(s) have no id_number (data row {', '.join(rows)}{more}). "
+            "Every CML needs an identifier."
+        )
+
+
 def _score(
     request: Request, loaded: Any, df: pd.DataFrame, *, source: str | None
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
@@ -326,6 +346,7 @@ def _score(
     validation = validate_cml_dataframe(df)
     if not validation["valid"]:
         raise UploadError("; ".join(validation["errors"]))
+    _require_identifiers(df)
 
     features = engineer_features(df, minimum_thickness_mm=settings.DEFAULT_MINIMUM_THICKNESS)
 
@@ -619,6 +640,7 @@ async def generate_report(request: Request, file: UploadFile = File(...)) -> dic
     validation = validate_cml_dataframe(df)
     if not validation["valid"]:
         raise UploadError("; ".join(validation["errors"]))
+    _require_identifiers(df)
 
     features = engineer_features(df, minimum_thickness_mm=settings.DEFAULT_MINIMUM_THICKNESS)
     columns = _feature_columns(loaded)

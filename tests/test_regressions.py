@@ -269,3 +269,32 @@ class TestNoOverrideAuditTrailShips:
         result = manager.apply_overrides_to_predictions(frame)
         assert manager.get_override_map() == {}
         assert result.loc[0, "recommendation"] == "KEEP"
+
+
+class TestMissingIdentifiersAreClientErrors:
+    """Found by automated review of #19. pandas 3 keeps a missing value as
+    NaN through astype(str) (pandas 2 produced the string "nan"), so a blank
+    id_number failed response validation and the whole batch became a 500.
+    Every result and override lookup is keyed by the id, so a CML without
+    one is refused with the rows named, rather than scored anonymously."""
+
+    HEADER = "id_number,average_corrosion_rate,thickness_mm,commodity,feature_type,cml_shape\n"
+    ROW = ",0.1,9.5,Crude Oil,Pipe,Internal\n"
+
+    @pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "whitespace"])
+    def test_a_row_without_an_id_is_a_400_naming_it(self, client, blank):
+        csv = self.HEADER + "CML-1" + self.ROW + blank + self.ROW + "CML-3" + self.ROW
+        response = client.post(
+            "/score-cml-data", files={"file": ("x.csv", csv.encode(), "text/csv")}
+        )
+        assert response.status_code == 400
+        assert "id_number" in response.json()["detail"]
+        assert "2" in response.json()["detail"]  # the offending data row
+
+    def test_rows_with_ids_still_score(self, client):
+        csv = self.HEADER + "CML-1" + self.ROW
+        response = client.post(
+            "/score-cml-data", files={"file": ("x.csv", csv.encode(), "text/csv")}
+        )
+        assert response.status_code == 200
+        assert response.json()["results"][0]["id_number"] == "CML-1"
