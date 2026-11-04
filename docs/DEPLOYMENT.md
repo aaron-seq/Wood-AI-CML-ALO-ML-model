@@ -144,8 +144,10 @@ Before exposing this to users:
 - [ ] **Persist `data/`** on a real volume. Losing it loses the SME audit trail.
 - [ ] **Run one replica, or move overrides to a database first.** Writes are
       atomic and guarded by an advisory lock, which makes concurrent writers
-      on a *single host* safe. The lock does not coordinate across hosts or
-      over a network filesystem.
+      on a *single host* safe. Unix uses `flock`; Windows uses a sidecar byte-range
+      lock through Python's [msvcrt.locking](https://docs.python.org/3/library/msvcrt.html#msvcrt.locking) (up to ten acquisition attempts, one
+      second apart). The lock does not coordinate across hosts or over a network
+      filesystem. The JSON storage format is unchanged.
 - [ ] **Wire `/health` to your orchestrator's liveness and readiness probes.**
       Treat `status: degraded` as not-ready.
 - [ ] **Set `LOG_FORMAT=json`** so logs carry request id, path, status and

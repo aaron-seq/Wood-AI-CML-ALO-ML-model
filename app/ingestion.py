@@ -13,10 +13,14 @@ server fault.
 
 from __future__ import annotations
 
+import csv
 import logging
 import re
+import warnings
 import zipfile
-from io import BytesIO
+from codecs import BOM_UTF8
+from collections.abc import Iterator
+from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import PurePosixPath
 from xml.etree.ElementTree import ParseError
 
@@ -122,6 +126,20 @@ def _check_archive(payload: bytes, limit: int) -> None:
 
 
 _CSV_SIGNIFICANT = re.compile(rb'[",\r\n]')
+_CSV_NONBLANK = re.compile(rb"[^ \t\r\n]")
+
+
+def _csv_record_start(payload: bytes, start: int) -> int:
+    """Skip complete blank lines without discarding a record's leading spaces."""
+    match = _CSV_NONBLANK.search(payload, start)
+    if match is None:
+        return len(payload)
+    # Leading spaces on an actual record still count toward its byte limit.
+    return max(
+        start,
+        payload.rfind(b"\r", start, match.start()) + 1,
+        payload.rfind(b"\n", start, match.start()) + 1,
+    )
 
 
 def _record_width(payload: bytes, start: int, what: str) -> tuple[int, int]:
@@ -164,7 +182,7 @@ def _record_width(payload: bytes, start: int, what: str) -> tuple[int, int]:
     return fields, len(payload)
 
 
-def _check_csv_width(payload: bytes) -> None:
+def _check_csv_width(payload: bytes) -> tuple[int, int] | None:
     """Reject a CSV whose header or first data row is too wide.
 
     Rows after the first are refused by the parser itself when wider than
@@ -174,13 +192,65 @@ def _check_csv_width(payload: bytes) -> None:
     applies. A scan of physical lines was tried first and was wrong: pandas
     skips blank lines and quoted fields span lines, so a wide row could sit
     past the scan and be accepted with ~50,000 index levels.
+
+    Returns the first data offset and header width when legacy trailing
+    fields need checking after parsing, otherwise None.
     """
-    _, end = _record_width(payload, 0, "header row")
-    # pandas skips blank lines, so the first data row is the next non-blank one.
-    while end < len(payload) and payload[end] in b"\r\n":
-        end += 1
-    if end < len(payload):
-        _record_width(payload, end, "first data row")
+    start = len(BOM_UTF8) if payload.startswith(BOM_UTF8) else 0
+    start = _csv_record_start(payload, start)
+    columns, end = _record_width(payload, start, "header row")
+    start = _csv_record_start(payload, end)
+    if start >= len(payload):
+        return None
+    fields, end = _record_width(payload, start, "first data row")
+    if fields > columns:
+        # This record is already bounded in bytes and fields. Decode only
+        # this exceptional case to retain harmless empty trailing fields
+        # without silently dropping real values beyond the header.
+        row = next(csv.reader(StringIO(payload[start:end].decode("utf-8"), newline="")))
+        if any(row[columns:]):
+            raise UploadError(
+                f"The first data row has {fields} columns, but the header has {columns}. "
+                "Name the extra columns or remove the surplus values."
+            )
+        return start, columns
+    return None
+
+
+def _check_csv_trailing_fields(payload: bytes, start: int, columns: int, rows: int) -> None:
+    """Check legacy trailing fields only within the rows pandas actually read.
+
+    An empty trailing field in the first row widens pandas' internal schema;
+    later nonempty extras then get truncated too. This exceptional second
+    pass runs after pandas has bounded the accepted rows and their width.
+    """
+    with TextIOWrapper(BytesIO(payload), encoding="utf-8", newline="") as stream:
+        stream.seek(start)
+        nonblank = False
+
+        def lines() -> Iterator[str]:
+            nonlocal nonblank
+            for line in stream:
+                nonblank |= bool(line.strip(" \t\r\n"))
+                yield line
+
+        reader = csv.reader(lines())
+        for _ in range(rows):
+            while True:
+                nonblank = False
+                try:
+                    row = next(reader)
+                except StopIteration:
+                    return
+                # Quoted empty fields are data; only physically blank lines
+                # are skipped, matching pandas' skip_blank_lines behaviour.
+                if nonblank:
+                    break
+            if any(row[columns:]):
+                raise UploadError(
+                    f"A data row has nonempty values beyond the {columns}-column header. "
+                    "Name the extra columns or remove the surplus values."
+                )
 
 
 def parse_bytes(
@@ -221,25 +291,38 @@ def parse_bytes(
 
     nrows = None if max_rows is None else max_rows + 1
 
-    if suffix in CSV_SUFFIXES:
-        _check_csv_width(payload)
-    elif max_inflated_bytes is not None:
-        _check_archive(payload, max_inflated_bytes)
-
     try:
         if suffix in CSV_SUFFIXES:
+            trailing_fields = _check_csv_width(payload)
             # index_col=False: a row with more fields than the header is a
             # parse error. By default pandas promoted the surplus to index
             # levels, so one 2,000,000-field row cost 187 s and 3.8 GB to
             # accept, and rows with a trailing delimiter were mis-shifted.
-            frame = pd.read_csv(BytesIO(payload), nrows=nrows, index_col=False, dtype=_ID_AS_TEXT)
+            with warnings.catch_warnings():
+                if trailing_fields is not None:
+                    # The discarded fields are verified below. Invalid ones
+                    # produce UploadError instead of a truncation warning.
+                    warnings.filterwarnings(
+                        "ignore",
+                        "Length of header or names does not match length of data",
+                        pd.errors.ParserWarning,
+                    )
+                frame = pd.read_csv(
+                    BytesIO(payload), nrows=nrows, index_col=False, dtype=_ID_AS_TEXT
+                )
+            if trailing_fields is not None:
+                _check_csv_trailing_fields(payload, *trailing_fields, len(frame))
         else:
+            if max_inflated_bytes is not None:
+                _check_archive(payload, max_inflated_bytes)
             # Pinned: pandas otherwise picks a reader from the archive's
             # contents, so a renamed .ods or .xlsb reached readers that are
             # not installed and failed with ImportError.
             frame = pd.read_excel(
                 BytesIO(payload), nrows=nrows, engine="openpyxl", dtype=_ID_AS_TEXT
             )
+    except UploadError:
+        raise
     except _WORKBOOK_ERRORS as exc:
         # None of these is a ValueError, so each used to escape as a 500.
         raise UploadError("The file is not a valid .xlsx workbook.") from exc
@@ -247,7 +330,7 @@ def parse_bytes(
         raise UploadError(
             "The file could not be decoded as text. Save it as UTF-8 CSV or as .xlsx."
         ) from exc
-    except ValueError as exc:
+    except (ValueError, csv.Error) as exc:
         # pandas raises ValueError/EmptyDataError for headerless, empty and
         # structurally broken files. These are caller mistakes, not faults.
         raise UploadError(f"The file could not be parsed: {exc}") from exc

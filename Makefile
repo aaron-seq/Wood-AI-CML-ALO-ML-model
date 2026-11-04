@@ -53,7 +53,7 @@ typecheck:  ## Run static type checking
 	$(VENV)/bin/mypy
 
 audit:  ## Check dependencies for known vulnerabilities
-	$(VENV)/bin/pip-audit
+	$(PY) -m pip_audit
 
 format:  ## Apply formatting and safe lint fixes
 	$(VENV)/bin/ruff check --fix .

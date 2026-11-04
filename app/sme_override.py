@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,9 @@ from pathlib import Path
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+if sys.platform == "win32":  # pragma: no cover - Windows only
+    import msvcrt
 
 try:  # pragma: no cover - platform dependent
     import fcntl
@@ -52,24 +56,32 @@ class SMEOverrideManager:
         """Serialise read-modify-write cycles across processes.
 
         Uses an advisory lock on a sidecar file, so the lock is never the
-        thing being replaced by the atomic rename below. Advisory locking
-        is unavailable on some platforms; there the block still runs, and
-        concurrent writers remain the caller's problem to avoid (see
-        docs/DEPLOYMENT.md on running a single replica).
+        thing being replaced by the atomic rename below. Unix uses flock;
+        Windows locks the first byte with msvcrt, including past EOF on a
+        new sidecar. Other platforms without flock retain the unlocked
+        fallback (see docs/DEPLOYMENT.md on running a single replica).
         """
-        if not _HAVE_FLOCK:
+        if sys.platform != "win32" and not _HAVE_FLOCK:
             logger.debug("Advisory locking unavailable on this platform")
             yield
             return
 
         lock_path = self.override_file.with_suffix(self.override_file.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock_path, "w") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+        with open(lock_path, "a+b") as handle:
+            if sys.platform == "win32":  # pragma: no cover - Windows only
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                if sys.platform == "win32":  # pragma: no cover - Windows only
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
 
     def _save_overrides(self, overrides: list[dict]):
         """Write the override list atomically.

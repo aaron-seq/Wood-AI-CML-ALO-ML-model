@@ -363,3 +363,95 @@ class TestMalformedWorkbooksAreClientErrors:
         every .xls upload failed after the fact."""
         with pytest.raises(UploadError, match="Unsupported file format"):
             parse_bytes(b"\xd0\xcf\x11\xe0", "old.xls")
+
+
+_CSV_BLANK_LAYOUTS = [
+    pytest.param(b"\n", b"", id="leading-blank"),
+    pytest.param(b" \t\r\n\r", b"", id="leading-whitespace-and-mixed-endings"),
+    pytest.param(b"\xef\xbb\xbf\n", b"", id="bom-before-blank"),
+    pytest.param(b"", b" \t\n\t\r\n", id="whitespace-before-data"),
+]
+
+
+class TestCSVRecordSelection:
+    @pytest.mark.parametrize("record", ["header", "data"])
+    def test_leading_spaces_on_a_real_record_still_count_toward_its_limit(self, record):
+        from app import ingestion
+
+        spaces = b" " * (ingestion.MAX_RECORD_BYTES + 1)
+        header = (spaces if record == "header" else b"") + b"a,b,c\n"
+        row = (spaces if record == "data" else b"") + b"1,2,3\n"
+        with pytest.raises(UploadError, match="longer than"):
+            parse_within_limits(header + row, "cml.csv", 10_000_000, 10)
+
+    def test_invalid_utf8_in_surplus_fields_remains_a_client_error(self):
+        with pytest.raises(UploadError, match="decoded"):
+            parse_within_limits(b"a,b,c\n1,2,3,\xff\n", "cml.csv", 10_000_000, 10)
+
+    @pytest.mark.parametrize("prefix,gap", _CSV_BLANK_LAYOUTS)
+    @pytest.mark.parametrize("problem", ["columns", "length"])
+    def test_first_real_data_row_is_bounded_before_parsing(self, prefix, gap, problem, monkeypatch):
+        from app import ingestion
+
+        row = (
+            b",".join([b"1"] * (ingestion.MAX_COLUMNS + 1))
+            if problem == "columns"
+            else b"x" * (ingestion.MAX_RECORD_BYTES + 1) + b",2,3"
+        )
+        payload = prefix + b"a,b,c\n" + gap + row + b"\n"
+        parsed = []
+        real_read_csv = pd.read_csv
+
+        def track_parse(*args, **kwargs):
+            parsed.append(True)
+            return real_read_csv(*args, **kwargs)
+
+        monkeypatch.setattr(pd, "read_csv", track_parse)
+        message = "columns" if problem == "columns" else "first data row"
+        with pytest.raises(UploadError, match=message):
+            parse_within_limits(payload, "cml.csv", 10_000_000, 10)
+        assert not parsed
+
+    @pytest.mark.parametrize("prefix,gap", _CSV_BLANK_LAYOUTS)
+    def test_valid_records_with_the_same_layout_are_preserved(self, prefix, gap):
+        payload = prefix + b"a,b,c\n" + gap + b"1,2,3\n"
+        parsed = parse_within_limits(payload, "cml.csv", 10_000_000, 10)
+        assert parsed.to_dict("records") == [{"a": 1, "b": 2, "c": 3}]
+
+    @pytest.mark.parametrize(
+        "row",
+        [b"1,2,3,4\n", b'"1\nx",2,3,4\n', b'1,"2,3",4,5\n', b"1,2,3,4,\n"],
+        ids=["plain", "quoted-newline", "quoted-comma", "then-empty-field"],
+    )
+    def test_nonempty_fields_beyond_the_header_are_not_silently_discarded(self, row):
+        with pytest.raises(UploadError, match="header"):
+            parse_within_limits(b"a,b,c\n" + row, "cml.csv", 10_000_000, 10)
+
+    @pytest.mark.parametrize("row", [b'1,2,3,""\n', b'1,2,3,,""\n'])
+    @pytest.mark.filterwarnings("ignore::pandas.errors.ParserWarning")
+    def test_empty_trailing_fields_remain_compatible(self, row):
+        parsed = parse_within_limits(b"a,b,c\n" + row, "cml.csv", 10_000_000, 10)
+        assert parsed.to_dict("records") == [{"a": 1, "b": 2, "c": 3}]
+
+    def test_empty_trailing_fields_do_not_hide_values_in_later_rows(self):
+        with pytest.raises(UploadError, match="header"):
+            parse_within_limits(b"a,b,c\n1,2,3,\n\n4,5,6,7\n", "cml.csv", 10_000_000, 10)
+
+    @pytest.mark.filterwarnings("ignore::pandas.errors.ParserWarning")
+    def test_trailing_field_validation_stops_at_the_parsed_row_limit(self):
+        payload = b'a,b,c\n1,2,3,\n\n4,5,6,""\n7,8,9,10\n'
+        with pytest.raises(UploadError, match="row limit"):
+            parse_within_limits(payload, "cml.csv", 10_000_000, 1)
+
+    @pytest.mark.parametrize("endpoint", ["/upload-cml-data", "/score-cml-data"])
+    def test_api_rejects_an_overwide_first_row_after_blank_lines(self, client, endpoint):
+        from app import ingestion
+
+        header = b"id_number,average_corrosion_rate,thickness_mm,commodity,feature_type,cml_shape\n"
+        row = b"CML-001,0.12,9.5,Crude Oil,Pipe,Internal" + b",1" * ingestion.MAX_COLUMNS
+        response = client.post(
+            endpoint,
+            files={"file": ("cml.csv", b"\n" + header + row + b"\n", "text/csv")},
+        )
+        assert response.status_code == 400
+        assert "columns" in response.json()["detail"]

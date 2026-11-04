@@ -54,8 +54,10 @@ what to fix.
 Upload endpoints accept `.csv` and `.xlsx` as `multipart/form-data` under
 the field name `file`. Defaults: 25 MB and 100,000 rows (sizes here are
 binary: 1 MB = 1,048,576 bytes). A CSV may have at most 256 columns (the schema
-has twelve); a data row wider than the header is a parse error, and the
-header and first data row may each be at most 64 KB. An `.xlsx` may decompress
+has twelve); surplus data fields are rejected rather than silently discarded
+(empty trailing fields remain accepted for compatibility). The first nonblank
+header and data records may each be at most 64 KB; blank lines, including lines
+containing only spaces or tabs, do not bypass these checks. An `.xlsx` may decompress
 to at most 4 × the byte limit, with a shared-strings table of at most 16 MB.
 `id_number` is always read as text, so leading zeros survive. Legacy `.xls` is
 not accepted: no reader for it is installed, so it never worked.
