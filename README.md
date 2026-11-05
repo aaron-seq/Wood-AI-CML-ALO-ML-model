@@ -11,7 +11,7 @@ override system exists because an engineer, not the model, owns the call.
 
 [![CI](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
-![Coverage](https://img.shields.io/badge/coverage-91%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -72,6 +72,28 @@ them:
 
 ---
 
+## Configuration
+
+Every setting is an environment variable (or a line in `.env`), read once at
+startup. [`.env.example`](.env.example) lists them all with their defaults;
+copy it to `.env` to change one. The ones most deployments touch:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | Where the API listens, in or out of a container |
+| `API_KEY` / `API_KEY_SCOPE` | unset / `writes` | Optional shared-secret auth — see [Authentication](#authentication) |
+| `CORS_ORIGINS` | `http://localhost:8501` | Dashboard origin; `*` is refused |
+| `MODEL_DIR` / `MODEL_FILENAME` | `models` / `cml_elimination_model.joblib` | Which artifact to serve |
+| `MAX_UPLOAD_BYTES` / `MAX_UPLOAD_ROWS` | 25 MB / 100,000 | Upload bounds |
+| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | `json` for log shippers |
+| `METRICS_ENABLED` | `false` | Expose `/metrics` |
+| `CML_API_URL` | `http://localhost:8000` | Where the dashboard finds the API |
+
+Production guidance for each is in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#configuration).
+
+---
+
 ## API
 
 Full reference with request and response bodies:
@@ -84,6 +106,7 @@ Full reference with request and response bodies:
 | `GET` | `/metrics` | Prometheus metrics (404 unless enabled) |
 | `POST` | `/upload-cml-data` | Parse and validate a file without scoring it |
 | `POST` | `/score-cml-data` | Score every CML, applying any expert overrides |
+| `POST` | `/predict` | Score one CML sent as JSON, same pipeline as a batch |
 | `POST` | `/forecast-remaining-life` | Remaining life and next inspection date |
 | `POST` | `/generate-report` | Aggregated elimination analysis |
 | `GET` | `/sme-override` | List overrides and agreement statistics |
@@ -110,7 +133,7 @@ first 100, as before.
 
 Off by default. Set `API_KEY` (16+ characters) and callers must send
 `X-API-Key`. `API_KEY_SCOPE=writes` (the default) gates only the endpoints
-that mutate the SME audit trail; `all` gates scoring and reporting too. `/`
+that mutate the SME audit trail; `all` gates scoring, reporting and `/metrics` too. `/`
 and `/health` are never gated, so orchestrator probes keep working.
 
 This is a shared secret, not an identity: `sme_name` on an override is still
@@ -243,6 +266,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
 | [Model card](docs/MODEL_CARD.md) | Intended use, metrics, limitations |
 | [ADRs](docs/adr/) | Why the significant decisions were made |
 | [Contributing](CONTRIBUTING.md) | Workflow and standards |
+| [Data](data/README.md) | The datasets, their columns, and how the labels were made |
+| [Security policy](SECURITY.md) | How to report a vulnerability; what deployers own |
+| [Project status](docs/PROJECT-STATUS.md) | Current state, open decisions, and where to resume |
 
 ---
 
@@ -265,7 +291,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
   request. Measured at 553 ms for 50,000 CMLs, so this is a concurrency limit
   rather than a latency one — see [measured throughput](docs/DEPLOYMENT.md#measured-throughput).
 
-Planned work is tracked in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#future-work).
+Planned work is tracked as [GitHub issues](https://github.com/aaron-seq/Wood-AI-CML-ALO-ML-model/issues), summarised in order in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#future-work).
 
 ---
 

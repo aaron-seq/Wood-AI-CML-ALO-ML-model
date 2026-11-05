@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
+import subprocess
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -228,3 +231,70 @@ class TestPredictionRowAlignment:
         body = client.post("/score-cml-data", files=csv_upload(valid_cml_frame)).json()
         returned = [row["id_number"] for row in body["results"]]
         assert returned == valid_cml_frame["id_number"].tolist()
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OVERRIDE_STORE = "data/sme_overrides.json"
+
+
+class TestNoOverrideAuditTrailShips:
+    """A fresh install must start with an empty override audit trail.
+
+    The repository tracked a test record overriding CML-209 to ELIMINATE,
+    attributed to a named engineer with the reason "Eliminate". CML-209 is
+    in the bundled sample dataset, so every clone and every image silently
+    retired that inspection location against the model's KEEP. The compose
+    volume is seeded from the image, so the record also reached deployments.
+    """
+
+    def test_the_store_is_not_tracked_by_git(self):
+        if shutil.which("git") is None or not (REPO_ROOT / ".git").exists():
+            pytest.skip("not a git checkout")
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", OVERRIDE_STORE],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert tracked == "", f"{OVERRIDE_STORE} is tracked; it is per-deployment state"
+
+    def test_the_store_is_excluded_from_the_image(self):
+        patterns = (REPO_ROOT / ".dockerignore").read_text().splitlines()
+        assert OVERRIDE_STORE in patterns
+
+    def test_a_missing_store_applies_no_overrides(self, tmp_path):
+        manager = SMEOverrideManager(tmp_path / "sme_overrides.json")
+        frame = pd.DataFrame({"id_number": ["CML-209"], "recommendation": ["KEEP"]})
+        result = manager.apply_overrides_to_predictions(frame)
+        assert manager.get_override_map() == {}
+        assert result.loc[0, "recommendation"] == "KEEP"
+
+
+class TestMissingIdentifiersAreClientErrors:
+    """Found by automated review of #19. pandas 3 keeps a missing value as
+    NaN through astype(str) (pandas 2 produced the string "nan"), so a blank
+    id_number failed response validation and the whole batch became a 500.
+    Every result and override lookup is keyed by the id, so a CML without
+    one is refused with the rows named, rather than scored anonymously."""
+
+    HEADER = "id_number,average_corrosion_rate,thickness_mm,commodity,feature_type,cml_shape\n"
+    ROW = ",0.1,9.5,Crude Oil,Pipe,Internal\n"
+
+    @pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "whitespace"])
+    def test_a_row_without_an_id_is_a_400_naming_it(self, client, blank):
+        csv = self.HEADER + "CML-1" + self.ROW + blank + self.ROW + "CML-3" + self.ROW
+        response = client.post(
+            "/score-cml-data", files={"file": ("x.csv", csv.encode(), "text/csv")}
+        )
+        assert response.status_code == 400
+        assert "id_number" in response.json()["detail"]
+        assert "2" in response.json()["detail"]  # the offending data row
+
+    def test_rows_with_ids_still_score(self, client):
+        csv = self.HEADER + "CML-1" + self.ROW
+        response = client.post(
+            "/score-cml-data", files={"file": ("x.csv", csv.encode(), "text/csv")}
+        )
+        assert response.status_code == 200
+        assert response.json()["results"][0]["id_number"] == "CML-1"

@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -52,6 +52,14 @@ filterwarnings = [
     # deployment error, not a test-time nuisance -- fail loudly if it
     # reappears after a dependency bump.
     "error::sklearn.exceptions.InconsistentVersionWarning",
+    # A deprecation raised from *our* code is a future breakage with a
+    # deadline. pandas 3 deprecated setting values through ``.at`` on a new
+    # column; the override path did exactly that and would have raised a
+    # KeyError under pandas 4. Third-party internals are not gated here:
+    # they are not ours to fix, and failing on them breaks the build on
+    # every upstream release.
+    "error::DeprecationWarning:app\\.",
+    "error::FutureWarning:app\\.",
 ]
 
 [tool.coverage.run]
@@ -85,5 +93,5 @@ disallow_untyped_defs = false
 # explicitly means a *new* untyped import is reported rather than silently
 # absorbed by a blanket ignore_missing_imports = true.
 [[tool.mypy.overrides]]
-module = ["joblib.*", "plotly.*", "sklearn.*"]
+module = ["joblib.*", "openpyxl.*", "plotly.*", "sklearn.*"]
 ignore_missing_imports = true

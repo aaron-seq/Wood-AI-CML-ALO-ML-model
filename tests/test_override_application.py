@@ -9,6 +9,7 @@ human-in-the-loop was decorative.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
 
@@ -167,7 +168,11 @@ class TestDurableWrites:
         SMEOverrideManager(path)
 
         ids = [f"CML-{index:03d}" for index in range(12)]
-        with ProcessPoolExecutor(max_workers=4) as pool:
+        # Explicit spawn: fork from a multi-threaded test process can deadlock
+        # (CPython warns about it), and 3.14 changed the Linux default to
+        # forkserver, so leaving it implicit tests different things per runtime.
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=4, mp_context=context) as pool:
             list(pool.map(_write_override, [(str(path), cml_id) for cml_id in ids]))
 
         stored = {item["id_number"] for item in SMEOverrideManager(path).get_all_overrides()}

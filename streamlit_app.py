@@ -32,7 +32,7 @@ try:
     from app.forecasting import CMLForecaster
     from app.ingestion import UploadError, parse_within_limits
     from app.sme_override import SMEOverrideManager
-    from app.utils import validate_cml_dataframe
+    from app.utils import neutralise_spreadsheet_formulas, validate_cml_dataframe
 except ImportError as e:
     logger.error(f"Import error: {e}")
     st.error("Failed to import required modules. Please check your installation.")
@@ -296,7 +296,7 @@ elif page == "Upload & Analyze":
         )
 
         # Download button
-        csv = res_df.to_csv(index=False)
+        csv = neutralise_spreadsheet_formulas(res_df).to_csv(index=False)
         st.download_button(
             label="Download Detailed Report",
             data=csv,
@@ -577,7 +577,7 @@ elif page == "Reports":
         st.subheader("Export Data")
         col1, col2 = st.columns(2)
         with col1:
-            csv = df.to_csv(index=False)
+            csv = neutralise_spreadsheet_formulas(df).to_csv(index=False)
             st.download_button(
                 label="Download Full Dataset",
                 data=csv,

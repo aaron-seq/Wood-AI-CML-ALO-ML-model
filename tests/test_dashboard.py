@@ -13,11 +13,16 @@ endpoints have their own tests.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
-APP = "streamlit_app.py"
+# Absolute, because Streamlit 1.66 changed AppTest.from_file to resolve a
+# relative path against the calling test file rather than the working
+# directory. An absolute path means the same thing under both rules.
+APP = str(Path(__file__).resolve().parents[1] / "streamlit_app.py")
 STARTUP_TIMEOUT = 30
 
 

@@ -29,6 +29,35 @@ _STANDARD_RECORD_FIELDS = frozenset(logging.LogRecord("", 0, "", 0, "", None, No
 }
 
 
+# C0 and C1 controls plus the Unicode line and paragraph separators: every
+# character a log viewer may treat as a line break or a terminal command.
+_UNSAFE_IN_A_LOG_LINE = {
+    code: f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+    for code in [*range(0x00, 0x20), *range(0x7F, 0xA0), 0x2028, 0x2029]
+}
+# The escape character itself, so a literal "\x0a" typed into a filename
+# cannot be mistaken for an escaped newline.
+_UNSAFE_IN_A_LOG_LINE[ord("\\")] = "\\\\"
+
+
+class TextFormatter(logging.Formatter):
+    """The human-readable format, safe against forged log lines.
+
+    Request-derived values reach log messages -- an upload's filename, ids
+    inside the file. A newline in one forged a convincing second log line.
+    The message is escaped once here rather than at every call site; the
+    traceback, which comes from the server, keeps its lines.
+    """
+
+    def formatMessage(self, record: logging.LogRecord) -> str:  # noqa: N802 (stdlib name)
+        original = record.message
+        record.message = original.translate(_UNSAFE_IN_A_LOG_LINE)
+        try:
+            return super().formatMessage(record)
+        finally:
+            record.message = original
+
+
 class JsonFormatter(logging.Formatter):
     """Render log records as single-line JSON.
 
@@ -72,7 +101,7 @@ def configure_logging() -> None:
     if settings.LOG_FORMAT == "json":
         formatter = JsonFormatter()
     else:
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        formatter = TextFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
     for handler in root.handlers:
         handler.setFormatter(formatter)

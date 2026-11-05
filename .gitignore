@@ -208,3 +208,10 @@ __marimo__/
 
 # Advisory lock sidecar for the SME override store (runtime artifact).
 *.json.lock
+
+# Local virtualenvs under any suffix (.venv3.12, ...).
+.venv*
+
+# The SME override audit trail is per-deployment state, not source.
+data/sme_overrides.json
+data/sme_overrides.json.lock

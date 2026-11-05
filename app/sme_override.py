@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,9 @@ from pathlib import Path
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+if sys.platform == "win32":  # pragma: no cover - Windows only
+    import msvcrt
 
 try:  # pragma: no cover - platform dependent
     import fcntl
@@ -52,24 +56,32 @@ class SMEOverrideManager:
         """Serialise read-modify-write cycles across processes.
 
         Uses an advisory lock on a sidecar file, so the lock is never the
-        thing being replaced by the atomic rename below. Advisory locking
-        is unavailable on some platforms; there the block still runs, and
-        concurrent writers remain the caller's problem to avoid (see
-        docs/DEPLOYMENT.md on running a single replica).
+        thing being replaced by the atomic rename below. Unix uses flock;
+        Windows locks the first byte with msvcrt, including past EOF on a
+        new sidecar. Other platforms without flock retain the unlocked
+        fallback (see docs/DEPLOYMENT.md on running a single replica).
         """
-        if not _HAVE_FLOCK:
+        if sys.platform != "win32" and not _HAVE_FLOCK:
             logger.debug("Advisory locking unavailable on this platform")
             yield
             return
 
         lock_path = self.override_file.with_suffix(self.override_file.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock_path, "w") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+        with open(lock_path, "a+b") as handle:
+            if sys.platform == "win32":  # pragma: no cover - Windows only
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                if sys.platform == "win32":  # pragma: no cover - Windows only
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
 
     def _save_overrides(self, overrides: list[dict]):
         """Write the override list atomically.
@@ -186,29 +198,26 @@ class SMEOverrideManager:
             return predictions_df
 
         override_dict = {ov["id_number"]: ov for ov in overrides}
+        matched = predictions_df["id_number"].map(override_dict.get)
+        has_override = matched.notna()
 
-        predictions_df["has_sme_override"] = False
-        predictions_df["sme_decision"] = None
-        predictions_df["sme_reason"] = None
-        predictions_df["sme_name"] = None
-        predictions_df["sme_override_date"] = None
+        def field(key: str) -> pd.Series:
+            return matched.map(lambda ov: ov[key] if isinstance(ov, dict) else None)
 
-        for idx, row in predictions_df.iterrows():
-            cml_id = row["id_number"]
+        predictions_df["has_sme_override"] = has_override
+        predictions_df["sme_decision"] = field("sme_decision")
+        predictions_df["sme_reason"] = field("reason")
+        predictions_df["sme_name"] = field("sme_name")
+        predictions_df["sme_override_date"] = field("override_date")
 
-            if cml_id in override_dict:
-                override = override_dict[cml_id]
-
-                predictions_df.at[idx, "has_sme_override"] = True
-                predictions_df.at[idx, "sme_decision"] = override["sme_decision"]
-                predictions_df.at[idx, "sme_reason"] = override["reason"]
-                predictions_df.at[idx, "sme_name"] = override["sme_name"]
-                predictions_df.at[idx, "sme_override_date"] = override["override_date"]
-
-                if "recommendation" in predictions_df.columns:
-                    predictions_df.at[idx, "final_decision"] = override["sme_decision"]
-                else:
-                    predictions_df.at[idx, "recommendation"] = override["sme_decision"]
+        # Null for rows nobody overruled: callers use notna() on this column
+        # to find the overruled rows. Written whole-column rather than per
+        # row with .at, which pandas 3 deprecated for a column that does not
+        # yet exist and pandas 4 turns into a KeyError.
+        target = (
+            "final_decision" if "recommendation" in predictions_df.columns else "recommendation"
+        )
+        predictions_df[target] = predictions_df["sme_decision"]
 
         return predictions_df
 
